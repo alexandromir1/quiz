@@ -1,36 +1,44 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# QuizLive
 
-## Getting Started
+Площадка для живых викторин: создатель загружает изображения и придумывает 4 варианта ответа, игроки заходят со своих телефонов по коду комнаты. Баллы зависят от правильности и скорости ответа.
 
-First, run the development server:
+## Как играет
+
+1. **Создатель** собирает викторину (`/create`) — картинка + 4 ответа на каждый вопрос.
+2. Открывает **лобби** — появляется код комнаты.
+3. **Игроки** заходят на `/join`, вводят код и имя.
+4. Ведущий запускает вопросы; на экране телефона — картинка и кнопки ответов.
+5. Чем быстрее правильный ответ, тем больше баллов (примерно 500–1000 за верный ответ).
+
+## Локальный запуск
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Открой [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Без внешних сервисов данные пишутся в папку `.data/` (подходит для разработки и одного инстанса).
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Деплой на Vercel
 
-## Learn More
+1. Залей репозиторий на GitHub.
+2. Импортируй проект в [Vercel](https://vercel.com/new).
+3. Для продакшена подключи **Upstash Redis** (Storage → Upstash в кабинете Vercel) — так комнаты и викторины переживают холодный старт и несколько серверов.
+4. Переменные окружения (подставятся сами при интеграции Upstash):
 
-To learn more about Next.js, take a look at the following resources:
+```
+UPSTASH_REDIS_REST_URL=...
+UPSTASH_REDIS_REST_TOKEN=...
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+5. Deploy.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Без Redis на Vercel локальный файловый стор недоступен: для стабильной работы в облаке Redis обязателен.
 
-## Deploy on Vercel
+## Стек
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Next.js (App Router)
+- TypeScript + Tailwind CSS
+- Upstash Redis (опционально локально, рекомендуется на Vercel)

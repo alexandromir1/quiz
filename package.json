@@ -1,5 +1,5 @@
 {
-  "name": "quiz-tmp",
+  "name": "quiz-live",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -9,6 +9,8 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.2",
+    "nanoid": "^6.0.1",
     "next": "16.3.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"
