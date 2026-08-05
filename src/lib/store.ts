@@ -1,4 +1,5 @@
-import { list, put } from "@vercel/blob";
+import { Redis } from "@upstash/redis";
+import { get, list, put } from "@vercel/blob";
 import { promises as fs } from "fs";
 import path from "path";
 import type { Question, Quiz, Room } from "./types";
@@ -7,10 +8,15 @@ const DATA_DIR = path.join(process.cwd(), ".data");
 const QUIZZES_FILE = path.join(DATA_DIR, "quizzes.json");
 const ROOMS_FILE = path.join(DATA_DIR, "rooms.json");
 
+const QUIZ_TTL_SEC = 60 * 60 * 24 * 7;
+const ROOM_TTL_SEC = 60 * 60 * 12;
+const REDIS_TIMEOUT_MS = 1200;
+const REDIS_COOLDOWN_MS = 60_000;
+
 export class StorageNotConfiguredError extends Error {
   constructor() {
     super(
-      "Нужно подключить Vercel Blob: Storage → Create → Blob, затем Redeploy.",
+      "Нужно подключить хранилище: Vercel Blob и/или Upstash Redis (KV), затем Redeploy.",
     );
     this.name = "StorageNotConfiguredError";
   }
@@ -30,7 +36,10 @@ type StoreShape = {
 
 const globalStore = globalThis as typeof globalThis & {
   __quizMemory?: StoreShape;
-  __blobLatestUrl?: Map<string, string>;
+  __blobData?: Map<string, unknown>;
+  __blobPath?: Map<string, string>;
+  __redis?: Redis | null;
+  __redisDeadUntil?: number;
 };
 
 function memory(): StoreShape {
@@ -40,11 +49,14 @@ function memory(): StoreShape {
   return globalStore.__quizMemory;
 }
 
-function latestUrlCache() {
-  if (!globalStore.__blobLatestUrl) {
-    globalStore.__blobLatestUrl = new Map();
-  }
-  return globalStore.__blobLatestUrl;
+function blobDataCache() {
+  if (!globalStore.__blobData) globalStore.__blobData = new Map();
+  return globalStore.__blobData;
+}
+
+function blobPathCache() {
+  if (!globalStore.__blobPath) globalStore.__blobPath = new Map();
+  return globalStore.__blobPath;
 }
 
 function isVercel() {
@@ -64,13 +76,54 @@ export function hasRedis() {
 }
 
 function requireStore() {
-  if (hasBlob()) return;
+  if (hasRedis() || hasBlob()) return;
   if (!isVercel()) return;
   throw new StorageNotConfiguredError();
 }
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function redisClient(): Redis | null {
+  if (!hasRedis()) return null;
+  if (globalStore.__redis !== undefined) return globalStore.__redis;
+  try {
+    const url =
+      process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+    const token =
+      process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+    if (!url || !token) {
+      globalStore.__redis = null;
+      return null;
+    }
+    globalStore.__redis = new Redis({ url, token });
+    return globalStore.__redis;
+  } catch {
+    globalStore.__redis = null;
+    return null;
+  }
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timeout after ${ms}ms`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function ensureDataDir() {
@@ -91,124 +144,245 @@ async function writeFileStore<T>(file: string, data: Record<string, T>) {
   await fs.writeFile(file, JSON.stringify(data), "utf8");
 }
 
-/**
- * Blob CDN caches overwrites for ≥60s. So we never overwrite:
- * each write creates a new immutable object under a folder prefix,
- * and readers pick the newest by uploadedAt.
- */
+async function streamToText(
+  stream: ReadableStream<Uint8Array> | null,
+): Promise<string> {
+  if (!stream) return "";
+  return new Response(stream).text();
+}
+
+/** Prefer Redis (fast, consistent). Fall back to Blob with immutable versions. */
+function redisAvailable() {
+  return Date.now() >= (globalStore.__redisDeadUntil ?? 0);
+}
+
+function markRedisDead() {
+  globalStore.__redisDeadUntil = Date.now() + REDIS_COOLDOWN_MS;
+}
+
+async function redisGet<T>(key: string): Promise<T | null> {
+  const redis = redisClient();
+  if (!redis || !redisAvailable()) return null;
+  try {
+    const value = await withTimeout(
+      redis.get<T>(key),
+      REDIS_TIMEOUT_MS,
+      "redis get",
+    );
+    return value ?? null;
+  } catch {
+    markRedisDead();
+    return null;
+  }
+}
+
+async function redisSet(key: string, value: unknown, ttlSec: number) {
+  const redis = redisClient();
+  if (!redis || !redisAvailable()) return false;
+  try {
+    await withTimeout(
+      redis.set(key, value, { ex: ttlSec }),
+      REDIS_TIMEOUT_MS,
+      "redis set",
+    );
+    return true;
+  } catch {
+    markRedisDead();
+    return false;
+  }
+}
+
+async function listAllBlobs(prefix: string) {
+  const blobs: Awaited<ReturnType<typeof list>>["blobs"] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await list({
+      prefix,
+      cursor,
+      limit: 1000,
+    });
+    blobs.push(...page.blobs);
+    cursor = page.hasMore ? page.cursor : undefined;
+  } while (cursor);
+  return blobs;
+}
+
 async function blobPutJson(folder: string, data: unknown): Promise<string> {
   const pathname = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
-  const result = await put(pathname, JSON.stringify(data), {
+  await put(pathname, JSON.stringify(data), {
     access: "public",
     addRandomSuffix: false,
     contentType: "application/json",
+    cacheControlMaxAge: 60,
   });
-  latestUrlCache().set(folder, result.url);
-  return result.url;
+  blobPathCache().set(folder, pathname);
+  blobDataCache().set(folder, data);
+  return pathname;
 }
 
 async function blobGetJson<T>(folder: string): Promise<T | null> {
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 8; attempt++) {
     try {
-      // Prefer same-isolate cache from the last write
-      const cachedUrl = latestUrlCache().get(folder);
-      if (cachedUrl) {
-        const cachedRes = await fetch(cachedUrl, {
-          cache: "no-store",
-          headers: {
-            Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`,
-          },
-        });
-        if (cachedRes.ok) return (await cachedRes.json()) as T;
-      }
-
-      const listed = await list({ prefix: `${folder}/`, limit: 100 });
-      if (listed.blobs.length === 0) {
-        await sleep(100 * (attempt + 1));
+      // Always list — path cache from this isolate can be older than another writer's blob
+      const listed = await listAllBlobs(`${folder}/`);
+      if (listed.length === 0) {
+        const knownPath = blobPathCache().get(folder);
+        if (knownPath) {
+          const direct = await get(knownPath, { access: "public" });
+          if (direct?.stream) {
+            const parsed = JSON.parse(await streamToText(direct.stream)) as T;
+            blobDataCache().set(folder, parsed);
+            return parsed;
+          }
+        }
+        await sleep(120 * (attempt + 1));
         continue;
       }
-      const newest = [...listed.blobs].sort(
+
+      const newest = [...listed].sort(
         (a, b) => b.uploadedAt.getTime() - a.uploadedAt.getTime(),
       )[0];
-      latestUrlCache().set(folder, newest.url);
+      blobPathCache().set(folder, newest.pathname);
 
-      const res = await fetch(newest.url, {
-        cache: "no-store",
-        headers: {
-          Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`,
-        },
-      });
-      if (res.status === 404) {
-        await sleep(100 * (attempt + 1));
+      const result = await get(newest.pathname, { access: "public" });
+      if (!result?.stream) {
+        await sleep(120 * (attempt + 1));
         continue;
       }
-      if (!res.ok) throw new Error(`Blob fetch ${res.status}`);
-      return (await res.json()) as T;
+      const parsed = JSON.parse(await streamToText(result.stream)) as T;
+      blobDataCache().set(folder, parsed);
+
+      const stale = listed
+        .sort((a, b) => b.uploadedAt.getTime() - a.uploadedAt.getTime())
+        .slice(8);
+      if (stale.length > 0) {
+        void import("@vercel/blob").then(({ del }) =>
+          del(stale.map((b) => b.url)).catch(() => undefined),
+        );
+      }
+
+      return parsed;
     } catch {
-      await sleep(120 * (attempt + 1));
+      await sleep(150 * (attempt + 1));
     }
   }
   return null;
 }
 
-export async function pingRedis(): Promise<{
+function quizKey(id: string) {
+  return `quiz:${id}`;
+}
+
+function roomKey(code: string) {
+  return `room:${code.toUpperCase()}`;
+}
+
+export async function pingStorage(): Promise<{
   ok: boolean;
   error?: string;
   latencyMs?: number;
   storage?: string;
+  redisOk?: boolean;
+  blobOk?: boolean;
 }> {
+  const started = Date.now();
+  let redisOk = false;
+  let blobOk = false;
+  const errors: string[] = [];
+
+  if (hasRedis()) {
+    const probe = `ping:${Date.now()}`;
+    const wrote = await redisSet(probe, { ok: true }, 60);
+    if (wrote) {
+      const got = await redisGet<{ ok: boolean }>(probe);
+      redisOk = got?.ok === true;
+      if (!redisOk) errors.push("redis_read_miss");
+    } else {
+      errors.push("redis_write_failed");
+    }
+  }
+
   if (hasBlob()) {
-    const started = Date.now();
     try {
       const folder = `ping/${Date.now()}`;
       await blobPutJson(folder, { ok: true });
+      // Bypass memory to verify network read path for other isolates
+      blobDataCache().delete(folder);
+      blobPathCache().delete(folder);
       const got = await blobGetJson<{ ok: boolean }>(folder);
-      return {
-        ok: got?.ok === true,
-        latencyMs: Date.now() - started,
-        storage: "blob-versioned",
-      };
+      blobOk = got?.ok === true;
+      if (!blobOk) errors.push("blob_read_miss");
     } catch (e) {
-      return {
-        ok: false,
-        error: e instanceof Error ? e.message : String(e),
-        latencyMs: Date.now() - started,
-        storage: "blob-versioned",
-      };
+      errors.push(e instanceof Error ? e.message : String(e));
     }
   }
-  return { ok: false, error: "blob_not_configured", storage: "none" };
+
+  const storage = redisOk ? "redis" : blobOk ? "blob-versioned" : "none";
+  return {
+    ok: redisOk || blobOk,
+    redisOk,
+    blobOk,
+    storage,
+    latencyMs: Date.now() - started,
+    error: errors.length ? errors.join("; ") : undefined,
+  };
+}
+
+/** @deprecated use pingStorage */
+export async function pingRedis() {
+  return pingStorage();
 }
 
 export async function saveQuiz(quiz: Quiz): Promise<void> {
   requireStore();
+  memory().quizzes[quiz.id] = quiz;
+
+  const redisOk = await redisSet(quizKey(quiz.id), quiz, QUIZ_TTL_SEC);
+
   if (hasBlob()) {
     await blobPutJson(`quizzes/${quiz.id}`, quiz);
-    for (let i = 0; i < 5; i++) {
-      const got = await blobGetJson<Quiz>(`quizzes/${quiz.id}`);
-      if (got?.id === quiz.id) return;
-      await sleep(80 * (i + 1));
-    }
-    throw new Error(
-      "Викторина сохранена, но пока не читается. Попробуй ещё раз.",
-    );
   }
-  memory().quizzes[quiz.id] = quiz;
-  const all = await readFileStore<Quiz>(QUIZZES_FILE);
-  all[quiz.id] = quiz;
-  await writeFileStore(QUIZZES_FILE, all);
+
+  if (redisOk || blobDataCache().has(`quizzes/${quiz.id}`)) return;
+
+  if (!isVercel()) {
+    const all = await readFileStore<Quiz>(QUIZZES_FILE);
+    all[quiz.id] = quiz;
+    await writeFileStore(QUIZZES_FILE, all);
+    return;
+  }
+
+  throw new Error(
+    "Викторина сохранена, но пока не читается. Попробуй ещё раз.",
+  );
 }
 
 export async function getQuiz(id: string): Promise<Quiz | null> {
   requireStore();
-  if (hasBlob()) {
-    return blobGetJson<Quiz>(`quizzes/${id}`);
+
+  const fromRedis = await redisGet<Quiz>(quizKey(id));
+  if (fromRedis) {
+    memory().quizzes[id] = fromRedis;
+    return fromRedis;
   }
+
+  if (hasBlob()) {
+    const fromBlob = await blobGetJson<Quiz>(`quizzes/${id}`);
+    if (fromBlob) {
+      memory().quizzes[id] = fromBlob;
+      void redisSet(quizKey(id), fromBlob, QUIZ_TTL_SEC);
+      return fromBlob;
+    }
+  }
+
   if (memory().quizzes[id]) return memory().quizzes[id];
-  const all = await readFileStore<Quiz>(QUIZZES_FILE);
-  if (all[id]) {
-    memory().quizzes[id] = all[id];
-    return all[id];
+
+  if (!isVercel()) {
+    const all = await readFileStore<Quiz>(QUIZZES_FILE);
+    if (all[id]) {
+      memory().quizzes[id] = all[id];
+      return all[id];
+    }
   }
   return null;
 }
@@ -223,32 +397,56 @@ export async function getQuizQuestion(
 
 export async function saveRoom(room: Room): Promise<void> {
   requireStore();
+  const key = room.code.toUpperCase();
+  room.code = key;
+  memory().rooms[key] = room;
+
+  const redisOk = await redisSet(roomKey(key), room, ROOM_TTL_SEC);
+
   if (hasBlob()) {
-    await blobPutJson(`rooms/${room.code}`, room);
-    for (let i = 0; i < 5; i++) {
-      const got = await blobGetJson<Room>(`rooms/${room.code}`);
-      if (got?.code === room.code) return;
-      await sleep(80 * (i + 1));
-    }
-    throw new Error("Комната сохранена, но пока не читается. Попробуй ещё раз.");
+    await blobPutJson(`rooms/${key}`, room);
   }
-  memory().rooms[room.code] = room;
-  const all = await readFileStore<Room>(ROOMS_FILE);
-  all[room.code] = room;
-  await writeFileStore(ROOMS_FILE, all);
+
+  if (redisOk || blobDataCache().has(`rooms/${key}`)) return;
+
+  if (!isVercel()) {
+    const all = await readFileStore<Room>(ROOMS_FILE);
+    all[key] = room;
+    await writeFileStore(ROOMS_FILE, all);
+    return;
+  }
+
+  throw new Error("Комната сохранена, но пока не читается. Попробуй ещё раз.");
 }
 
 export async function getRoom(code: string): Promise<Room | null> {
   requireStore();
   const key = code.toUpperCase();
-  if (hasBlob()) {
-    return blobGetJson<Room>(`rooms/${key}`);
+
+  const fromRedis = await redisGet<Room>(roomKey(key));
+  if (fromRedis) {
+    memory().rooms[key] = fromRedis;
+    return fromRedis;
   }
+
+  if (hasBlob()) {
+    // Always list newest — never sticky memory (host/player are different isolates)
+    const fromBlob = await blobGetJson<Room>(`rooms/${key}`);
+    if (fromBlob) {
+      memory().rooms[key] = fromBlob;
+      void redisSet(roomKey(key), fromBlob, ROOM_TTL_SEC);
+      return fromBlob;
+    }
+  }
+
   if (memory().rooms[key]) return memory().rooms[key];
-  const all = await readFileStore<Room>(ROOMS_FILE);
-  if (all[key]) {
-    memory().rooms[key] = all[key];
-    return all[key];
+
+  if (!isVercel()) {
+    const all = await readFileStore<Room>(ROOMS_FILE);
+    if (all[key]) {
+      memory().rooms[key] = all[key];
+      return all[key];
+    }
   }
   return null;
 }
@@ -260,39 +458,35 @@ export async function mutateRoom(
   requireStore();
   const key = code.toUpperCase();
 
-  for (let attempt = 0; attempt < 8; attempt++) {
-    if (hasBlob()) {
-      const room = await blobGetJson<Room & { _v?: number }>(`rooms/${key}`);
-      if (!room) return null;
-      const version = room._v ?? 0;
-      mutator(room);
-      room._v = version + 1;
-      await blobPutJson(`rooms/${key}`, room);
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const room = await getRoom(key);
+    if (!room) return null;
 
-      for (let i = 0; i < 5; i++) {
-        const verify = await blobGetJson<Room & { _v?: number }>(
-          `rooms/${key}`,
-        );
-        if (verify && (verify._v ?? 0) >= (room._v ?? 0)) return verify;
-        await sleep(60 * (i + 1));
-      }
-      continue;
-    }
-
-    let room = memory().rooms[key];
-    if (!room) {
-      const all = await readFileStore<Room>(ROOMS_FILE);
-      room = all[key];
-      if (!room) return null;
-      memory().rooms[key] = room;
-    }
-    const clone = structuredClone(room);
+    const version = (room as Room & { _v?: number })._v ?? 0;
+    const clone = structuredClone(room) as Room & { _v?: number };
     mutator(clone);
-    memory().rooms[key] = clone;
-    const all = await readFileStore<Room>(ROOMS_FILE);
-    all[key] = clone;
-    await writeFileStore(ROOMS_FILE, all);
-    return clone;
+    clone._v = version + 1;
+    clone.code = key;
+
+    const redisOk = await redisSet(roomKey(key), clone, ROOM_TTL_SEC);
+    if (hasBlob()) {
+      await blobPutJson(`rooms/${key}`, clone);
+    }
+
+    if (redisOk || hasBlob()) {
+      memory().rooms[key] = clone;
+      return clone;
+    }
+
+    if (!isVercel()) {
+      memory().rooms[key] = clone;
+      const all = await readFileStore<Room>(ROOMS_FILE);
+      all[key] = clone;
+      await writeFileStore(ROOMS_FILE, all);
+      return clone;
+    }
+
+    await sleep(80 * (attempt + 1));
   }
 
   return null;

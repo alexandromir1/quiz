@@ -12,6 +12,7 @@
     "test:e2e:prod": "BASE_URL=https://quiz-topaz-eight.vercel.app node scripts/e2e-cycle.mjs"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.2",
     "@vercel/blob": "^2.6.1",
     "nanoid": "^6.0.1",
     "next": "16.3.0",

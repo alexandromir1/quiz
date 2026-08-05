@@ -16,21 +16,31 @@ export default function JoinPage() {
     setLoading(true);
     const normalized = code.trim().toUpperCase();
     try {
-      const res = await fetch(`/api/rooms/${normalized}/join`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
-      const data = (await res.json()) as {
-        playerId?: string;
-        error?: string;
-      };
-      if (!res.ok || !data.playerId) {
-        throw new Error(data.error ?? "Не удалось войти");
+      let lastError = "Не удалось войти";
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const res = await fetch(`/api/rooms/${normalized}/join`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        const data = (await res.json()) as {
+          playerId?: string;
+          error?: string;
+        };
+        if (res.ok && data.playerId) {
+          localStorage.setItem(`player:${normalized}`, data.playerId);
+          localStorage.setItem(`player-name:${normalized}`, name.trim());
+          router.push(`/play/${normalized}`);
+          return;
+        }
+        lastError = data.error ?? lastError;
+        // Retry not-found — storage can lag briefly across regions
+        if (res.status !== 404 && res.status !== 500) {
+          throw new Error(lastError);
+        }
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
       }
-      localStorage.setItem(`player:${normalized}`, data.playerId);
-      localStorage.setItem(`player-name:${normalized}`, name.trim());
-      router.push(`/play/${normalized}`);
+      throw new Error(lastError);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка");
       setLoading(false);
