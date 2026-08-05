@@ -36,25 +36,31 @@ function isVercel() {
   return Boolean(process.env.VERCEL);
 }
 
+/** Resolve Upstash / Vercel KV REST credentials (any common prefix). */
+function redisCredentials(): { url: string; token: string } | null {
+  const pairs: Array<[string | undefined, string | undefined]> = [
+    [process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN],
+    [process.env.KV_REST_API_URL, process.env.KV_REST_API_TOKEN],
+    [process.env.STORAGE_REST_API_URL, process.env.STORAGE_REST_API_TOKEN],
+    [process.env.REDIS_REST_API_URL, process.env.REDIS_REST_API_TOKEN],
+  ];
+  for (const [url, token] of pairs) {
+    if (url && token) return { url, token };
+  }
+  return null;
+}
+
 /** Upstash Redis or Vercel KV (same protocol). */
 export function hasRedis() {
-  return Boolean(
-    (process.env.UPSTASH_REDIS_REST_URL &&
-      process.env.UPSTASH_REDIS_REST_TOKEN) ||
-      (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) ||
-      (process.env.KV_REST_API_URL && process.env.REDIS_URL),
-  );
+  return redisCredentials() != null;
 }
 
 function redis() {
-  const url =
-    process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-  const token =
-    process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
-  if (!url || !token) {
+  const creds = redisCredentials();
+  if (!creds) {
     throw new StorageNotConfiguredError();
   }
-  return new Redis({ url, token });
+  return new Redis(creds);
 }
 
 function requireStore() {
