@@ -1,13 +1,14 @@
-/** Compress an image until it fits Redis/Upstash free-tier value limits. */
+/** Compress an image to a small JPEG data URL (for Redis fallback). */
 export async function fileToCompressedDataUrl(file: File): Promise<string> {
   const bitmap = await createImageBitmap(file);
-  const maxBytes = 110_000; // ~110 KB — safe under ~1 MB Redis request limit
+  const maxBytes = 45_000;
   const steps: Array<{ maxEdge: number; quality: number }> = [
-    { maxEdge: 720, quality: 0.62 },
-    { maxEdge: 640, quality: 0.52 },
+    { maxEdge: 640, quality: 0.55 },
     { maxEdge: 520, quality: 0.45 },
     { maxEdge: 420, quality: 0.38 },
-    { maxEdge: 320, quality: 0.32 },
+    { maxEdge: 360, quality: 0.32 },
+    { maxEdge: 280, quality: 0.28 },
+    { maxEdge: 220, quality: 0.24 },
   ];
 
   try {
@@ -20,6 +21,14 @@ export async function fileToCompressedDataUrl(file: File): Promise<string> {
   } finally {
     bitmap.close();
   }
+}
+
+/** Compress to a JPEG File for Blob upload. */
+export async function fileToCompressedJpegFile(file: File): Promise<File> {
+  const dataUrl = await fileToCompressedDataUrl(file);
+  const res = await fetch(dataUrl);
+  const blob = await res.blob();
+  return new File([blob], "question.jpg", { type: "image/jpeg" });
 }
 
 function encodeBitmap(

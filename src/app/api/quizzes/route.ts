@@ -43,14 +43,20 @@ export async function POST(request: Request) {
 
     const questions: Question[] = [];
     for (const q of body.questions) {
-      if (!q.imageDataUrl?.startsWith("data:image/")) {
+      if (
+        !q.imageDataUrl?.startsWith("data:image/") &&
+        !q.imageDataUrl?.startsWith("https://")
+      ) {
         return NextResponse.json(
           { error: "Каждый вопрос должен содержать изображение" },
           { status: 400 },
         );
       }
-      // ~150KB binary ≈ ~200k chars in base64 data-url
-      if (q.imageDataUrl.length > 220_000) {
+      // data URLs must stay small; https Blob URLs are short
+      if (
+        q.imageDataUrl.startsWith("data:image/") &&
+        q.imageDataUrl.length > 220_000
+      ) {
         return NextResponse.json(
           {
             error:

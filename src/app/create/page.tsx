@@ -4,7 +4,10 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { ANSWER_STYLES } from "@/components/answer-grid";
-import { fileToCompressedDataUrl } from "@/lib/image";
+import {
+  fileToCompressedDataUrl,
+  fileToCompressedJpegFile,
+} from "@/lib/image";
 
 type DraftQuestion = {
   key: string;
@@ -22,22 +25,44 @@ function emptyQuestion(): DraftQuestion {
   };
 }
 
+async function prepareImage(file: File): Promise<string> {
+  // Prefer Vercel Blob URL (tiny Redis value). Fall back to compressed data URL.
+  try {
+    const jpeg = await fileToCompressedJpegFile(file);
+    const form = new FormData();
+    form.append("file", jpeg);
+    const res = await fetch("/api/upload", { method: "POST", body: form });
+    if (res.ok) {
+      const data = (await res.json()) as { url?: string };
+      if (data.url) return data.url;
+    }
+  } catch {
+    // continue to data-URL fallback
+  }
+  return fileToCompressedDataUrl(file);
+}
+
 export default function CreatePage() {
   const router = useRouter();
   const [title, setTitle] = useState("");
   const [questions, setQuestions] = useState<DraftQuestion[]>([emptyQuestion()]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadingIndex, setUploadingIndex] = useState<number | null>(null);
 
   async function onImageChange(index: number, file: File | null) {
     if (!file) return;
+    setError(null);
+    setUploadingIndex(index);
     try {
-      const imageDataUrl = await fileToCompressedDataUrl(file);
+      const imageDataUrl = await prepareImage(file);
       setQuestions((prev) =>
         prev.map((q, i) => (i === index ? { ...q, imageDataUrl } : q)),
       );
     } catch {
       setError("Не удалось обработать изображение");
+    } finally {
+      setUploadingIndex(null);
     }
   }
 
@@ -135,7 +160,11 @@ export default function CreatePage() {
                   q.imageDataUrl ? "" : "hover:border-[var(--accent)]/50"
                 }`}
               >
-                {q.imageDataUrl ? (
+                {uploadingIndex === qi ? (
+                  <span className="px-4 text-center text-sm text-[var(--accent)]">
+                    Сжимаем и загружаем…
+                  </span>
+                ) : q.imageDataUrl ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
                     src={q.imageDataUrl}

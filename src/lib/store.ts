@@ -128,6 +128,9 @@ function isTooLargeError(e: unknown): boolean {
   return /max request|too large|payload|Request failed|ERR max/i.test(msg);
 }
 
+/** Keep each Redis command well under free-tier request limits. */
+const CHUNK_CHARS = 40_000;
+
 async function redisSet(key: string, value: string, ex: number) {
   try {
     await redis().set(key, value, { ex });
@@ -135,6 +138,72 @@ async function redisSet(key: string, value: string, ex: number) {
     if (isTooLargeError(e)) throw new StorageTooLargeError();
     throw e;
   }
+}
+
+async function setLargeString(key: string, value: string, ex: number) {
+  const r = redis();
+  if (value.length <= CHUNK_CHARS) {
+    await redisSet(key, value, ex);
+    return;
+  }
+
+  const n = Math.ceil(value.length / CHUNK_CHARS);
+  try {
+    const pipe = r.pipeline();
+    pipe.set(key, JSON.stringify({ __chunks: n }), { ex });
+    for (let i = 0; i < n; i++) {
+      pipe.set(
+        `${key}:${i}`,
+        value.slice(i * CHUNK_CHARS, (i + 1) * CHUNK_CHARS),
+        { ex },
+      );
+    }
+    await pipe.exec();
+  } catch (e) {
+    // Pipeline may fail on size — fall back to sequential tiny chunks
+    if (!isTooLargeError(e)) throw e;
+    await redisSet(key, JSON.stringify({ __chunks: n }), ex);
+    for (let i = 0; i < n; i++) {
+      await redisSet(
+        `${key}:${i}`,
+        value.slice(i * CHUNK_CHARS, (i + 1) * CHUNK_CHARS),
+        ex,
+      );
+    }
+  }
+}
+
+async function getLargeString(key: string): Promise<string | null> {
+  const raw = await redis().get(key);
+  if (raw == null) return null;
+
+  const asMeta = (v: unknown): number | null => {
+    if (typeof v === "string") {
+      try {
+        const parsed = JSON.parse(v) as { __chunks?: number };
+        return typeof parsed?.__chunks === "number" ? parsed.__chunks : null;
+      } catch {
+        return null;
+      }
+    }
+    if (v && typeof v === "object" && "__chunks" in v) {
+      const n = (v as { __chunks?: number }).__chunks;
+      return typeof n === "number" ? n : null;
+    }
+    return null;
+  };
+
+  const chunks = asMeta(raw);
+  if (chunks == null) {
+    return typeof raw === "string" ? raw : String(raw);
+  }
+
+  const parts: string[] = [];
+  for (let i = 0; i < chunks; i++) {
+    const part = await redis().get(`${key}:${i}`);
+    parts.push(typeof part === "string" ? part : String(part ?? ""));
+  }
+  return parts.join("");
 }
 
 export async function saveQuiz(quiz: Quiz): Promise<void> {
@@ -153,7 +222,12 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
     };
     await redisSet(`quiz:${quiz.id}`, JSON.stringify(meta), QUIZ_TTL);
     for (const q of quiz.questions) {
-      await redisSet(`quiz:${quiz.id}:img:${q.id}`, q.imageDataUrl, QUIZ_TTL);
+      // https Blob URLs stay small; data URLs are chunked automatically
+      await setLargeString(
+        `quiz:${quiz.id}:img:${q.id}`,
+        q.imageDataUrl,
+        QUIZ_TTL,
+      );
     }
     return;
   }
@@ -171,9 +245,8 @@ export async function getQuiz(id: string): Promise<Quiz | null> {
     if (!meta) return null;
     const questions: Question[] = [];
     for (const q of meta.questions) {
-      const img = await redis().get<string>(`quiz:${id}:img:${q.id}`);
       const imageDataUrl =
-        typeof img === "string" ? img : img != null ? String(img) : "";
+        (await getLargeString(`quiz:${id}:img:${q.id}`)) ?? "";
       questions.push({ ...q, imageDataUrl });
     }
     return {
@@ -204,10 +277,8 @@ export async function getQuizQuestion(
     if (!meta) return null;
     const q = meta.questions[index];
     if (!q) return null;
-    const img = await redis().get<string>(`quiz:${quizId}:img:${q.id}`);
-    const imageDataUrl =
-      typeof img === "string" ? img : img != null ? String(img) : "";
-    return { ...q, imageDataUrl };
+    const img = await getLargeString(`quiz:${quizId}:img:${q.id}`);
+    return { ...q, imageDataUrl: img ?? "" };
   }
   const quiz = await getQuiz(quizId);
   return quiz?.questions[index] ?? null;
