@@ -38,9 +38,19 @@ export async function POST(
       return NextResponse.json({ error: "Игрок не найден" }, { status: 404 });
     }
 
-    const existing = await getRoom(code);
+    let existing = await getRoom(code);
+    for (let i = 0; i < 6 && existing && existing.phase !== "question"; i++) {
+      await new Promise((r) => setTimeout(r, 120 * (i + 1)));
+      existing = await getRoom(code);
+    }
     if (!existing) {
       return NextResponse.json({ error: "Комната не найдена" }, { status: 404 });
+    }
+    if (existing.phase !== "question" || existing.questionStartedAt == null) {
+      return NextResponse.json(
+        { error: "Сейчас нельзя отвечать" },
+        { status: 400 },
+      );
     }
     const question = await getQuizQuestion(
       existing.quizId,
