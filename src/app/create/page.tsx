@@ -122,12 +122,21 @@ export default function CreatePage() {
       const data = (await res.json()) as {
         id?: string;
         hostSecret?: string;
+        title?: string;
+        questionCount?: number;
         error?: string;
       };
       if (!res.ok || !data.id || !data.hostSecret) {
         throw new Error(data.error ?? "Ошибка сохранения");
       }
       localStorage.setItem(`quiz-host:${data.id}`, data.hostSecret);
+      localStorage.setItem(
+        `quiz-meta:${data.id}`,
+        JSON.stringify({
+          title: data.title ?? title,
+          questionCount: data.questionCount ?? questions.length,
+        }),
+      );
       router.push(`/quiz/${data.id}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ошибка");

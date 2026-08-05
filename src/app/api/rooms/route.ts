@@ -63,9 +63,8 @@ export async function POST(request: Request) {
     if (e instanceof StorageTooLargeError) {
       return NextResponse.json({ error: e.message }, { status: 413 });
     }
-    return NextResponse.json(
-      { error: "Не удалось создать комнату" },
-      { status: 500 },
-    );
+    const message =
+      e instanceof Error ? e.message : "Не удалось создать комнату";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

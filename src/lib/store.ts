@@ -1,4 +1,4 @@
-import { put } from "@vercel/blob";
+import { get, put } from "@vercel/blob";
 import { promises as fs } from "fs";
 import path from "path";
 import type { Question, Quiz, Room } from "./types";
@@ -16,6 +16,13 @@ export class StorageNotConfiguredError extends Error {
   }
 }
 
+export class StorageTooLargeError extends Error {
+  constructor() {
+    super("Хранилище отклонило данные. Попробуй ещё раз.");
+    this.name = "StorageTooLargeError";
+  }
+}
+
 type StoreShape = {
   quizzes: Record<string, Quiz>;
   rooms: Record<string, Room>;
@@ -23,7 +30,6 @@ type StoreShape = {
 
 const globalStore = globalThis as typeof globalThis & {
   __quizMemory?: StoreShape;
-  __blobOrigin?: string;
 };
 
 function memory(): StoreShape {
@@ -55,6 +61,10 @@ function requireStore() {
   throw new StorageNotConfiguredError();
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function ensureDataDir() {
   await fs.mkdir(DATA_DIR, { recursive: true });
 }
@@ -73,33 +83,21 @@ async function writeFileStore<T>(file: string, data: Record<string, T>) {
   await fs.writeFile(file, JSON.stringify(data), "utf8");
 }
 
-function rememberOriginFromUrl(url: string) {
-  try {
-    globalStore.__blobOrigin = new URL(url).origin;
-  } catch {
-    // ignore
+async function streamToText(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(value);
   }
-}
-
-async function ensureBlobOrigin(): Promise<string> {
-  if (globalStore.__blobOrigin) return globalStore.__blobOrigin;
-
-  // Discover store origin via a tiny write (list API is unreliable here)
-  const probe = await put(
-    `__probe/${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
-    "{}",
-    {
-      access: "public",
-      addRandomSuffix: true,
-      contentType: "application/json",
-    },
-  );
-  rememberOriginFromUrl(probe.url);
-  return globalStore.__blobOrigin!;
-}
-
-function publicUrlFor(origin: string, pathname: string): string {
-  return `${origin}/${pathname}`;
+  const merged = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.length;
+  }
+  return new TextDecoder().decode(merged);
 }
 
 async function blobPutJson(pathname: string, data: unknown): Promise<string> {
@@ -109,19 +107,24 @@ async function blobPutJson(pathname: string, data: unknown): Promise<string> {
     allowOverwrite: true,
     contentType: "application/json",
   });
-  rememberOriginFromUrl(result.url);
   return result.url;
 }
 
 async function blobGetJson<T>(pathname: string): Promise<T | null> {
-  const origin = await ensureBlobOrigin();
-  const url = publicUrlFor(origin, pathname);
-  const res = await fetch(url, { cache: "no-store" });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`Blob read failed (${res.status}) for ${pathname}`);
+  // Official SDK read — avoids public CDN 403 from serverless fetches
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const result = await get(pathname, {
+      access: "public",
+      useCache: false,
+    });
+    if (!result || result.statusCode !== 200 || !result.stream) {
+      await sleep(150 * (attempt + 1));
+      continue;
+    }
+    const text = await streamToText(result.stream);
+    return JSON.parse(text) as T;
   }
-  return (await res.json()) as T;
+  return null;
 }
 
 export async function pingRedis(): Promise<{
@@ -157,7 +160,13 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
   requireStore();
   if (hasBlob()) {
     await blobPutJson(`quizzes/${quiz.id}.json`, quiz);
-    return;
+    // Verify readable before returning to client
+    for (let i = 0; i < 8; i++) {
+      const got = await blobGetJson<Quiz>(`quizzes/${quiz.id}.json`);
+      if (got?.id === quiz.id) return;
+      await sleep(100 * (i + 1));
+    }
+    throw new Error("Викторина сохранена, но пока не читается. Попробуй ещё раз.");
   }
   memory().quizzes[quiz.id] = quiz;
   const all = await readFileStore<Quiz>(QUIZZES_FILE);
@@ -191,7 +200,12 @@ export async function saveRoom(room: Room): Promise<void> {
   requireStore();
   if (hasBlob()) {
     await blobPutJson(`rooms/${room.code}.json`, room);
-    return;
+    for (let i = 0; i < 8; i++) {
+      const got = await blobGetJson<Room>(`rooms/${room.code}.json`);
+      if (got?.code === room.code) return;
+      await sleep(100 * (i + 1));
+    }
+    throw new Error("Комната сохранена, но пока не читается. Попробуй ещё раз.");
   }
   memory().rooms[room.code] = room;
   const all = await readFileStore<Room>(ROOMS_FILE);
@@ -221,7 +235,7 @@ export async function mutateRoom(
   requireStore();
   const key = code.toUpperCase();
 
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (let attempt = 0; attempt < 10; attempt++) {
     if (hasBlob()) {
       const room = await blobGetJson<Room & { _v?: number }>(
         `rooms/${key}.json`,
@@ -258,11 +272,4 @@ export async function mutateRoom(
   }
 
   return null;
-}
-
-export class StorageTooLargeError extends Error {
-  constructor() {
-    super("Хранилище отклонило данные. Попробуй ещё раз.");
-    this.name = "StorageTooLargeError";
-  }
 }

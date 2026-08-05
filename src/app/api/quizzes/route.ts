@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { nanoid } from "nanoid";
+import { safeId, safeSecret, safeShortId } from "@/lib/ids";
 import {
   saveQuiz,
   StorageNotConfiguredError,
@@ -63,10 +63,7 @@ export async function POST(request: Request) {
       }
       if (src.startsWith("data:image/") && src.length > 220_000) {
         return NextResponse.json(
-          {
-            error:
-              "Изображение слишком большое. Выбери другое фото — оно сожмётся автоматически.",
-          },
+          { error: "Изображение слишком большое" },
           { status: 400 },
         );
       }
@@ -88,7 +85,7 @@ export async function POST(request: Request) {
         );
       }
       questions.push({
-        id: nanoid(10),
+        id: safeShortId(),
         imageDataUrl: src,
         answers: answers as [string, string, string, string],
         correctIndex: q.correctIndex as 0 | 1 | 2 | 3,
@@ -96,11 +93,11 @@ export async function POST(request: Request) {
     }
 
     const quiz: Quiz = {
-      id: nanoid(12),
+      id: safeId(),
       title,
       questions,
       createdAt: Date.now(),
-      hostSecret: nanoid(24),
+      hostSecret: safeSecret(),
     };
 
     await saveQuiz(quiz);
@@ -110,6 +107,7 @@ export async function POST(request: Request) {
       hostSecret: quiz.hostSecret,
       title: quiz.title,
       questionCount: quiz.questions.length,
+      createdAt: quiz.createdAt,
     });
   } catch (e) {
     if (e instanceof StorageNotConfiguredError) {
