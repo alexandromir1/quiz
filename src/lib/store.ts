@@ -7,7 +7,7 @@ const DATA_DIR = path.join(process.cwd(), ".data");
 const QUIZZES_FILE = path.join(DATA_DIR, "quizzes.json");
 const ROOMS_FILE = path.join(DATA_DIR, "rooms.json");
 
-const QUIZ_TTL = 60 * 60 * 24 * 14; // 14 days
+const QUIZ_TTL = 60 * 60 * 24 * 7; // 7 days
 const ROOM_TTL = 60 * 60 * 24;
 
 export class StorageNotConfiguredError extends Error {
@@ -22,18 +22,23 @@ export class StorageNotConfiguredError extends Error {
 export class StorageTooLargeError extends Error {
   constructor() {
     super(
-      "Картинка слишком большая для хранилища. Попробуй другое фото или меньший файл.",
+      "Картинка слишком большая для хранилища. Подключи Vercel Blob и заново выбери фото.",
     );
     this.name = "StorageTooLargeError";
   }
 }
+
+type StoredQuestion = QuestionMeta & {
+  /** Present when image is a Blob/HTTPS URL (preferred). */
+  imageUrl?: string;
+};
 
 type QuizMeta = {
   id: string;
   title: string;
   createdAt: number;
   hostSecret: string;
-  questions: QuestionMeta[];
+  questions: StoredQuestion[];
 };
 
 type StoreShape = {
@@ -76,7 +81,10 @@ export function hasRedis() {
 function redis() {
   const creds = redisCredentials();
   if (!creds) throw new StorageNotConfiguredError();
-  return new Redis(creds);
+  return new Redis({
+    url: creds.url,
+    token: creds.token,
+  });
 }
 
 function requireStore() {
@@ -125,51 +133,42 @@ function parseMaybeJson<T>(value: unknown): T | null {
 
 function isTooLargeError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
-  return /max request|too large|payload|Request failed|ERR max/i.test(msg);
+  // Do NOT match generic "Request failed" — Upstash uses that for any error.
+  return /max request size|too large|payload too large|ERR max|value is too large/i.test(
+    msg,
+  );
 }
 
-/** Keep each Redis command well under free-tier request limits. */
-const CHUNK_CHARS = 40_000;
+function wrapRedisError(e: unknown): never {
+  if (isTooLargeError(e)) throw new StorageTooLargeError();
+  const msg = e instanceof Error ? e.message : String(e);
+  throw new Error(`Redis: ${msg.slice(0, 300)}`);
+}
 
 async function redisSet(key: string, value: string, ex: number) {
   try {
     await redis().set(key, value, { ex });
   } catch (e) {
-    if (isTooLargeError(e)) throw new StorageTooLargeError();
-    throw e;
+    wrapRedisError(e);
   }
 }
 
+const CHUNK_CHARS = 40_000;
+
 async function setLargeString(key: string, value: string, ex: number) {
-  const r = redis();
   if (value.length <= CHUNK_CHARS) {
     await redisSet(key, value, ex);
     return;
   }
 
   const n = Math.ceil(value.length / CHUNK_CHARS);
-  try {
-    const pipe = r.pipeline();
-    pipe.set(key, JSON.stringify({ __chunks: n }), { ex });
-    for (let i = 0; i < n; i++) {
-      pipe.set(
-        `${key}:${i}`,
-        value.slice(i * CHUNK_CHARS, (i + 1) * CHUNK_CHARS),
-        { ex },
-      );
-    }
-    await pipe.exec();
-  } catch (e) {
-    // Pipeline may fail on size — fall back to sequential tiny chunks
-    if (!isTooLargeError(e)) throw e;
-    await redisSet(key, JSON.stringify({ __chunks: n }), ex);
-    for (let i = 0; i < n; i++) {
-      await redisSet(
-        `${key}:${i}`,
-        value.slice(i * CHUNK_CHARS, (i + 1) * CHUNK_CHARS),
-        ex,
-      );
-    }
+  await redisSet(key, JSON.stringify({ __chunks: n }), ex);
+  for (let i = 0; i < n; i++) {
+    await redisSet(
+      `${key}:${i}`,
+      value.slice(i * CHUNK_CHARS, (i + 1) * CHUNK_CHARS),
+      ex,
+    );
   }
 }
 
@@ -206,6 +205,28 @@ async function getLargeString(key: string): Promise<string | null> {
   return parts.join("");
 }
 
+export async function pingRedis(): Promise<{
+  ok: boolean;
+  error?: string;
+  latencyMs?: number;
+}> {
+  if (!hasRedis()) return { ok: false, error: "not_configured" };
+  const started = Date.now();
+  try {
+    const key = `ping:${Date.now()}`;
+    await redis().set(key, "ok", { ex: 30 });
+    const val = await redis().get(key);
+    await redis().del(key);
+    return { ok: val === "ok" || val === '"ok"', latencyMs: Date.now() - started };
+  } catch (e) {
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+      latencyMs: Date.now() - started,
+    };
+  }
+}
+
 export async function saveQuiz(quiz: Quiz): Promise<void> {
   requireStore();
   if (hasRedis()) {
@@ -214,15 +235,25 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
       title: quiz.title,
       createdAt: quiz.createdAt,
       hostSecret: quiz.hostSecret,
-      questions: quiz.questions.map(({ id, answers, correctIndex }) => ({
-        id,
-        answers,
-        correctIndex,
-      })),
+      questions: quiz.questions.map((q) => {
+        const base: StoredQuestion = {
+          id: q.id,
+          answers: q.answers,
+          correctIndex: q.correctIndex,
+        };
+        // HTTPS Blob URLs live in meta (tiny). Avoid separate Redis image keys.
+        if (q.imageDataUrl.startsWith("https://")) {
+          base.imageUrl = q.imageDataUrl;
+        }
+        return base;
+      }),
     };
+
     await redisSet(`quiz:${quiz.id}`, JSON.stringify(meta), QUIZ_TTL);
+
+    // Only legacy/local data-URLs need chunked image keys
     for (const q of quiz.questions) {
-      // https Blob URLs stay small; data URLs are chunked automatically
+      if (q.imageDataUrl.startsWith("https://")) continue;
       await setLargeString(
         `quiz:${quiz.id}:img:${q.id}`,
         q.imageDataUrl,
@@ -245,9 +276,16 @@ export async function getQuiz(id: string): Promise<Quiz | null> {
     if (!meta) return null;
     const questions: Question[] = [];
     for (const q of meta.questions) {
-      const imageDataUrl =
-        (await getLargeString(`quiz:${id}:img:${q.id}`)) ?? "";
-      questions.push({ ...q, imageDataUrl });
+      let imageDataUrl = q.imageUrl ?? "";
+      if (!imageDataUrl) {
+        imageDataUrl = (await getLargeString(`quiz:${id}:img:${q.id}`)) ?? "";
+      }
+      questions.push({
+        id: q.id,
+        answers: q.answers,
+        correctIndex: q.correctIndex,
+        imageDataUrl,
+      });
     }
     return {
       id: meta.id,
@@ -277,8 +315,17 @@ export async function getQuizQuestion(
     if (!meta) return null;
     const q = meta.questions[index];
     if (!q) return null;
-    const img = await getLargeString(`quiz:${quizId}:img:${q.id}`);
-    return { ...q, imageDataUrl: img ?? "" };
+    let imageDataUrl = q.imageUrl ?? "";
+    if (!imageDataUrl) {
+      imageDataUrl =
+        (await getLargeString(`quiz:${quizId}:img:${q.id}`)) ?? "";
+    }
+    return {
+      id: q.id,
+      answers: q.answers,
+      correctIndex: q.correctIndex,
+      imageDataUrl,
+    };
   }
   const quiz = await getQuiz(quizId);
   return quiz?.questions[index] ?? null;
@@ -323,7 +370,12 @@ export async function mutateRoom(
     if (hasRedis()) {
       const r = redis();
       const redisKey = `room:${key}`;
-      const raw = await r.get(redisKey);
+      let raw: unknown;
+      try {
+        raw = await r.get(redisKey);
+      } catch (e) {
+        wrapRedisError(e);
+      }
       if (raw == null) return null;
 
       const prevStr = typeof raw === "string" ? raw : JSON.stringify(raw);
@@ -340,8 +392,7 @@ export async function mutateRoom(
         );
         if (ok === 1) return room;
       } catch (e) {
-        if (isTooLargeError(e)) throw new StorageTooLargeError();
-        throw e;
+        wrapRedisError(e);
       }
       continue;
     }
