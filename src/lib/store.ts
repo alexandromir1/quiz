@@ -243,21 +243,19 @@ export async function mutateRoom(
       if (!room) return null;
       const version = room._v ?? 0;
       mutator(room);
-      room._v = version + 1;
-
-      const latest = await blobGetJson<Room & { _v?: number }>(
-        `rooms/${key}.json`,
-      );
-      if (!latest) return null;
-      if ((latest._v ?? 0) !== version) continue;
-
+      room._v = version + 1 + attempt;
       await blobPutJson(`rooms/${key}.json`, room);
-      // Ensure the write is visible before callers continue the game loop
+
       for (let i = 0; i < 8; i++) {
         const verify = await blobGetJson<Room & { _v?: number }>(
           `rooms/${key}.json`,
         );
-        if (verify && (verify._v ?? 0) === room._v) return room;
+        if (!verify) {
+          await sleep(80 * (i + 1));
+          continue;
+        }
+        // Our write landed (or a newer one that already includes further progress)
+        if ((verify._v ?? 0) >= (room._v ?? 0)) return verify;
         await sleep(80 * (i + 1));
       }
       continue;
