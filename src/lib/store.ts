@@ -1,4 +1,4 @@
-import { list, put } from "@vercel/blob";
+import { put } from "@vercel/blob";
 import { promises as fs } from "fs";
 import path from "path";
 import type { Question, Quiz, Room } from "./types";
@@ -23,6 +23,7 @@ type StoreShape = {
 
 const globalStore = globalThis as typeof globalThis & {
   __quizMemory?: StoreShape;
+  __blobOrigin?: string;
 };
 
 function memory(): StoreShape {
@@ -40,7 +41,6 @@ export function hasBlob() {
   return Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 }
 
-/** Kept for /api/health compatibility */
 export function hasRedis() {
   return Boolean(
     (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) ||
@@ -51,7 +51,7 @@ export function hasRedis() {
 
 function requireStore() {
   if (hasBlob()) return;
-  if (!isVercel()) return; // local file store
+  if (!isVercel()) return;
   throw new StorageNotConfiguredError();
 }
 
@@ -73,21 +73,54 @@ async function writeFileStore<T>(file: string, data: Record<string, T>) {
   await fs.writeFile(file, JSON.stringify(data), "utf8");
 }
 
-async function blobPutJson(pathname: string, data: unknown) {
-  await put(pathname, JSON.stringify(data), {
+function rememberOriginFromUrl(url: string) {
+  try {
+    globalStore.__blobOrigin = new URL(url).origin;
+  } catch {
+    // ignore
+  }
+}
+
+async function ensureBlobOrigin(): Promise<string> {
+  if (globalStore.__blobOrigin) return globalStore.__blobOrigin;
+
+  // Discover store origin via a tiny write (list API is unreliable here)
+  const probe = await put(
+    `__probe/${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+    "{}",
+    {
+      access: "public",
+      addRandomSuffix: true,
+      contentType: "application/json",
+    },
+  );
+  rememberOriginFromUrl(probe.url);
+  return globalStore.__blobOrigin!;
+}
+
+function publicUrlFor(origin: string, pathname: string): string {
+  return `${origin}/${pathname}`;
+}
+
+async function blobPutJson(pathname: string, data: unknown): Promise<string> {
+  const result = await put(pathname, JSON.stringify(data), {
     access: "public",
     addRandomSuffix: false,
     allowOverwrite: true,
     contentType: "application/json",
   });
+  rememberOriginFromUrl(result.url);
+  return result.url;
 }
 
 async function blobGetJson<T>(pathname: string): Promise<T | null> {
-  const { blobs } = await list({ prefix: pathname, limit: 10 });
-  const match = blobs.find((b) => b.pathname === pathname);
-  if (!match) return null;
-  const res = await fetch(match.url, { cache: "no-store" });
-  if (!res.ok) return null;
+  const origin = await ensureBlobOrigin();
+  const url = publicUrlFor(origin, pathname);
+  const res = await fetch(url, { cache: "no-store" });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    throw new Error(`Blob read failed (${res.status}) for ${pathname}`);
+  }
   return (await res.json()) as T;
 }
 
@@ -198,14 +231,12 @@ export async function mutateRoom(
       mutator(room);
       room._v = version + 1;
 
-      // Re-read to reduce lost updates under concurrent answers
       const latest = await blobGetJson<Room & { _v?: number }>(
         `rooms/${key}.json`,
       );
       if (!latest) return null;
-      if ((latest._v ?? 0) !== version) {
-        continue;
-      }
+      if ((latest._v ?? 0) !== version) continue;
+
       await blobPutJson(`rooms/${key}.json`, room);
       return room;
     }
@@ -229,7 +260,6 @@ export async function mutateRoom(
   return null;
 }
 
-// Legacy export so old imports don't break
 export class StorageTooLargeError extends Error {
   constructor() {
     super("Хранилище отклонило данные. Попробуй ещё раз.");
