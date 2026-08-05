@@ -1,4 +1,4 @@
-import { get, list, put } from "@vercel/blob";
+import { list, put } from "@vercel/blob";
 import { promises as fs } from "fs";
 import path from "path";
 import type { Question, Quiz, Room } from "./types";
@@ -30,7 +30,7 @@ type StoreShape = {
 
 const globalStore = globalThis as typeof globalThis & {
   __quizMemory?: StoreShape;
-  __blobUrlCache?: Map<string, string>;
+  __blobLatestUrl?: Map<string, string>;
 };
 
 function memory(): StoreShape {
@@ -40,11 +40,11 @@ function memory(): StoreShape {
   return globalStore.__quizMemory;
 }
 
-function urlCache() {
-  if (!globalStore.__blobUrlCache) {
-    globalStore.__blobUrlCache = new Map();
+function latestUrlCache() {
+  if (!globalStore.__blobLatestUrl) {
+    globalStore.__blobLatestUrl = new Map();
   }
-  return globalStore.__blobUrlCache;
+  return globalStore.__blobLatestUrl;
 }
 
 function isVercel() {
@@ -91,113 +91,62 @@ async function writeFileStore<T>(file: string, data: Record<string, T>) {
   await fs.writeFile(file, JSON.stringify(data), "utf8");
 }
 
-async function streamToText(
-  stream: ReadableStream<Uint8Array>,
-): Promise<string> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) chunks.push(value);
-  }
-  const merged = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.length;
-  }
-  return new TextDecoder().decode(merged);
-}
-
-async function blobPutJson(pathname: string, data: unknown): Promise<string> {
+/**
+ * Blob CDN caches overwrites for ≥60s. So we never overwrite:
+ * each write creates a new immutable object under a folder prefix,
+ * and readers pick the newest by uploadedAt.
+ */
+async function blobPutJson(folder: string, data: unknown): Promise<string> {
+  const pathname = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
   const result = await put(pathname, JSON.stringify(data), {
     access: "public",
     addRandomSuffix: false,
-    allowOverwrite: true,
     contentType: "application/json",
   });
-  urlCache().set(pathname, result.url);
+  latestUrlCache().set(folder, result.url);
   return result.url;
 }
 
-function blobOriginFromToken(): string | null {
-  const token = process.env.BLOB_READ_WRITE_TOKEN;
-  if (!token?.startsWith("vercel_blob_rw_")) return null;
-  // vercel_blob_rw_<storeId>_<secret>
-  const rest = token.slice("vercel_blob_rw_".length);
-  const storeId = rest.split("_")[0];
-  if (!storeId) return null;
-  return `https://${storeId}.public.blob.vercel-storage.com`;
-}
-
-async function resolveUrl(pathname: string): Promise<string | null> {
-  const cached = urlCache().get(pathname);
-  if (cached) return cached;
-
-  const origin = blobOriginFromToken();
-  if (origin) {
-    const url = `${origin}/${pathname}`;
-    urlCache().set(pathname, url);
-    return url;
-  }
-
-  try {
-    const listed = await list({ prefix: pathname, limit: 20 });
-    const match = listed.blobs.find((b) => b.pathname === pathname);
-    if (match?.url) {
-      urlCache().set(pathname, match.url);
-      return match.url;
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-async function fetchJsonAuthed<T>(url: string): Promise<T | null> {
-  const res = await fetch(url, {
-    cache: "no-store",
-    headers: {
-      Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`,
-      "User-Agent": "QuizLiveStorage/1.0",
-    },
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`Blob fetch ${res.status}`);
-  }
-  return (await res.json()) as T;
-}
-
-async function blobGetJson<T>(pathname: string): Promise<T | null> {
+async function blobGetJson<T>(folder: string): Promise<T | null> {
   for (let attempt = 0; attempt < 5; attempt++) {
-    // 1) Official SDK get
     try {
-      const result = await get(pathname, {
-        access: "public",
-        useCache: false,
+      // Prefer same-isolate cache from the last write
+      const cachedUrl = latestUrlCache().get(folder);
+      if (cachedUrl) {
+        const cachedRes = await fetch(cachedUrl, {
+          cache: "no-store",
+          headers: {
+            Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`,
+          },
+        });
+        if (cachedRes.ok) return (await cachedRes.json()) as T;
+      }
+
+      const listed = await list({ prefix: `${folder}/`, limit: 100 });
+      if (listed.blobs.length === 0) {
+        await sleep(100 * (attempt + 1));
+        continue;
+      }
+      const newest = [...listed.blobs].sort(
+        (a, b) => b.uploadedAt.getTime() - a.uploadedAt.getTime(),
+      )[0];
+      latestUrlCache().set(folder, newest.url);
+
+      const res = await fetch(newest.url, {
+        cache: "no-store",
+        headers: {
+          Authorization: `Bearer ${process.env.BLOB_READ_WRITE_TOKEN}`,
+        },
       });
-      if (result?.statusCode === 200 && result.stream) {
-        const text = await streamToText(result.stream);
-        return JSON.parse(text) as T;
+      if (res.status === 404) {
+        await sleep(100 * (attempt + 1));
+        continue;
       }
+      if (!res.ok) throw new Error(`Blob fetch ${res.status}`);
+      return (await res.json()) as T;
     } catch {
-      // fall through to authed URL fetch
+      await sleep(120 * (attempt + 1));
     }
-
-    // 2) Authed fetch via known/listed URL (works around CDN 403)
-    try {
-      const url = await resolveUrl(pathname);
-      if (url) {
-        const data = await fetchJsonAuthed<T>(url);
-        if (data) return data;
-      }
-    } catch {
-      // retry
-    }
-
-    await sleep(120 * (attempt + 1));
   }
   return null;
 }
@@ -211,20 +160,20 @@ export async function pingRedis(): Promise<{
   if (hasBlob()) {
     const started = Date.now();
     try {
-      const key = `ping/${Date.now()}.json`;
-      await blobPutJson(key, { ok: true });
-      const got = await blobGetJson<{ ok: boolean }>(key);
+      const folder = `ping/${Date.now()}`;
+      await blobPutJson(folder, { ok: true });
+      const got = await blobGetJson<{ ok: boolean }>(folder);
       return {
         ok: got?.ok === true,
         latencyMs: Date.now() - started,
-        storage: "blob",
+        storage: "blob-versioned",
       };
     } catch (e) {
       return {
         ok: false,
         error: e instanceof Error ? e.message : String(e),
         latencyMs: Date.now() - started,
-        storage: "blob",
+        storage: "blob-versioned",
       };
     }
   }
@@ -234,11 +183,11 @@ export async function pingRedis(): Promise<{
 export async function saveQuiz(quiz: Quiz): Promise<void> {
   requireStore();
   if (hasBlob()) {
-    await blobPutJson(`quizzes/${quiz.id}.json`, quiz);
+    await blobPutJson(`quizzes/${quiz.id}`, quiz);
     for (let i = 0; i < 5; i++) {
-      const got = await blobGetJson<Quiz>(`quizzes/${quiz.id}.json`);
+      const got = await blobGetJson<Quiz>(`quizzes/${quiz.id}`);
       if (got?.id === quiz.id) return;
-      await sleep(100 * (i + 1));
+      await sleep(80 * (i + 1));
     }
     throw new Error(
       "Викторина сохранена, но пока не читается. Попробуй ещё раз.",
@@ -253,7 +202,7 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
 export async function getQuiz(id: string): Promise<Quiz | null> {
   requireStore();
   if (hasBlob()) {
-    return blobGetJson<Quiz>(`quizzes/${id}.json`);
+    return blobGetJson<Quiz>(`quizzes/${id}`);
   }
   if (memory().quizzes[id]) return memory().quizzes[id];
   const all = await readFileStore<Quiz>(QUIZZES_FILE);
@@ -275,11 +224,11 @@ export async function getQuizQuestion(
 export async function saveRoom(room: Room): Promise<void> {
   requireStore();
   if (hasBlob()) {
-    await blobPutJson(`rooms/${room.code}.json`, room);
+    await blobPutJson(`rooms/${room.code}`, room);
     for (let i = 0; i < 5; i++) {
-      const got = await blobGetJson<Room>(`rooms/${room.code}.json`);
+      const got = await blobGetJson<Room>(`rooms/${room.code}`);
       if (got?.code === room.code) return;
-      await sleep(100 * (i + 1));
+      await sleep(80 * (i + 1));
     }
     throw new Error("Комната сохранена, но пока не читается. Попробуй ещё раз.");
   }
@@ -293,7 +242,7 @@ export async function getRoom(code: string): Promise<Room | null> {
   requireStore();
   const key = code.toUpperCase();
   if (hasBlob()) {
-    return blobGetJson<Room>(`rooms/${key}.json`);
+    return blobGetJson<Room>(`rooms/${key}`);
   }
   if (memory().rooms[key]) return memory().rooms[key];
   const all = await readFileStore<Room>(ROOMS_FILE);
@@ -313,21 +262,19 @@ export async function mutateRoom(
 
   for (let attempt = 0; attempt < 8; attempt++) {
     if (hasBlob()) {
-      const room = await blobGetJson<Room & { _v?: number }>(
-        `rooms/${key}.json`,
-      );
+      const room = await blobGetJson<Room & { _v?: number }>(`rooms/${key}`);
       if (!room) return null;
       const version = room._v ?? 0;
       mutator(room);
-      room._v = version + 1 + attempt;
-      await blobPutJson(`rooms/${key}.json`, room);
+      room._v = version + 1;
+      await blobPutJson(`rooms/${key}`, room);
 
       for (let i = 0; i < 5; i++) {
         const verify = await blobGetJson<Room & { _v?: number }>(
-          `rooms/${key}.json`,
+          `rooms/${key}`,
         );
         if (verify && (verify._v ?? 0) >= (room._v ?? 0)) return verify;
-        await sleep(80 * (i + 1));
+        await sleep(60 * (i + 1));
       }
       continue;
     }
