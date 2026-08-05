@@ -1,4 +1,4 @@
-import { Redis } from "@upstash/redis";
+import { createClient } from "@vercel/kv";
 import { promises as fs } from "fs";
 import path from "path";
 import type { Question, QuestionMeta, Quiz, Room } from "./types";
@@ -7,13 +7,14 @@ const DATA_DIR = path.join(process.cwd(), ".data");
 const QUIZZES_FILE = path.join(DATA_DIR, "quizzes.json");
 const ROOMS_FILE = path.join(DATA_DIR, "rooms.json");
 
-const QUIZ_TTL = 60 * 60 * 24 * 7; // 7 days
+const QUIZ_TTL = 60 * 60 * 24 * 7;
 const ROOM_TTL = 60 * 60 * 24;
+const REDIS_TIMEOUT_MS = 6000;
 
 export class StorageNotConfiguredError extends Error {
   constructor() {
     super(
-      "На Vercel нужно подключить Redis: в проекте открой Storage → Create → Upstash Redis (или KV). Переменные подставятся сами, затем сделай Redeploy.",
+      "На Vercel нужно подключить Redis: Storage → Create → Upstash Redis (или KV), затем Redeploy.",
     );
     this.name = "StorageNotConfiguredError";
   }
@@ -29,7 +30,6 @@ export class StorageTooLargeError extends Error {
 }
 
 type StoredQuestion = QuestionMeta & {
-  /** Present when image is a Blob/HTTPS URL (preferred). */
   imageUrl?: string;
 };
 
@@ -63,13 +63,12 @@ function isVercel() {
 
 function redisCredentials(): { url: string; token: string } | null {
   const pairs: Array<[string | undefined, string | undefined]> = [
-    [process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN],
     [process.env.KV_REST_API_URL, process.env.KV_REST_API_TOKEN],
+    [process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN],
     [process.env.STORAGE_REST_API_URL, process.env.STORAGE_REST_API_TOKEN],
-    [process.env.REDIS_REST_API_URL, process.env.REDIS_REST_API_TOKEN],
   ];
   for (const [url, token] of pairs) {
-    if (url && token) return { url, token };
+    if (url?.startsWith("https://") && token) return { url, token };
   }
   return null;
 }
@@ -78,10 +77,10 @@ export function hasRedis() {
   return redisCredentials() != null;
 }
 
-function redis() {
+function kv() {
   const creds = redisCredentials();
   if (!creds) throw new StorageNotConfiguredError();
-  return new Redis({
+  return createClient({
     url: creds.url,
     token: creds.token,
   });
@@ -90,6 +89,26 @@ function redis() {
 function requireStore() {
   if (hasRedis()) return;
   if (isVercel()) throw new StorageNotConfiguredError();
+}
+
+async function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              `${label}: Redis не отвечает (${REDIS_TIMEOUT_MS}мс). Проверь KV_REST_API_URL/TOKEN и Redeploy.`,
+            ),
+          );
+        }, REDIS_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function ensureDataDir() {
@@ -110,14 +129,6 @@ async function writeFileStore<T>(file: string, data: Record<string, T>) {
   await fs.writeFile(file, JSON.stringify(data), "utf8");
 }
 
-const CAS_LUA = `
-local cur = redis.call("GET", KEYS[1])
-if not cur then return 0 end
-if cur ~= ARGV[1] then return 0 end
-redis.call("SET", KEYS[1], ARGV[2], "EX", tonumber(ARGV[3]))
-return 1
-`;
-
 function parseMaybeJson<T>(value: unknown): T | null {
   if (value == null) return null;
   if (typeof value === "string") {
@@ -133,7 +144,6 @@ function parseMaybeJson<T>(value: unknown): T | null {
 
 function isTooLargeError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
-  // Do NOT match generic "Request failed" — Upstash uses that for any error.
   return /max request size|too large|payload too large|ERR max|value is too large/i.test(
     msg,
   );
@@ -142,12 +152,20 @@ function isTooLargeError(e: unknown): boolean {
 function wrapRedisError(e: unknown): never {
   if (isTooLargeError(e)) throw new StorageTooLargeError();
   const msg = e instanceof Error ? e.message : String(e);
-  throw new Error(`Redis: ${msg.slice(0, 300)}`);
+  throw new Error(msg.slice(0, 400));
 }
 
 async function redisSet(key: string, value: string, ex: number) {
   try {
-    await redis().set(key, value, { ex });
+    await withTimeout(kv().set(key, value, { ex }), `SET ${key}`);
+  } catch (e) {
+    wrapRedisError(e);
+  }
+}
+
+async function redisGet(key: string): Promise<unknown> {
+  try {
+    return await withTimeout(kv().get(key), `GET ${key}`);
   } catch (e) {
     wrapRedisError(e);
   }
@@ -160,7 +178,6 @@ async function setLargeString(key: string, value: string, ex: number) {
     await redisSet(key, value, ex);
     return;
   }
-
   const n = Math.ceil(value.length / CHUNK_CHARS);
   await redisSet(key, JSON.stringify({ __chunks: n }), ex);
   for (let i = 0; i < n; i++) {
@@ -173,7 +190,7 @@ async function setLargeString(key: string, value: string, ex: number) {
 }
 
 async function getLargeString(key: string): Promise<string | null> {
-  const raw = await redis().get(key);
+  const raw = await redisGet(key);
   if (raw == null) return null;
 
   const asMeta = (v: unknown): number | null => {
@@ -199,7 +216,7 @@ async function getLargeString(key: string): Promise<string | null> {
 
   const parts: string[] = [];
   for (let i = 0; i < chunks; i++) {
-    const part = await redis().get(`${key}:${i}`);
+    const part = await redisGet(`${key}:${i}`);
     parts.push(typeof part === "string" ? part : String(part ?? ""));
   }
   return parts.join("");
@@ -214,10 +231,13 @@ export async function pingRedis(): Promise<{
   const started = Date.now();
   try {
     const key = `ping:${Date.now()}`;
-    await redis().set(key, "ok", { ex: 30 });
-    const val = await redis().get(key);
-    await redis().del(key);
-    return { ok: val === "ok" || val === '"ok"', latencyMs: Date.now() - started };
+    await withTimeout(kv().set(key, "ok", { ex: 30 }), "ping set");
+    const val = await withTimeout(kv().get<string>(key), "ping get");
+    await withTimeout(kv().del(key), "ping del");
+    return {
+      ok: val === "ok",
+      latencyMs: Date.now() - started,
+    };
   } catch (e) {
     return {
       ok: false,
@@ -241,7 +261,6 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
           answers: q.answers,
           correctIndex: q.correctIndex,
         };
-        // HTTPS Blob URLs live in meta (tiny). Avoid separate Redis image keys.
         if (q.imageDataUrl.startsWith("https://")) {
           base.imageUrl = q.imageDataUrl;
         }
@@ -249,9 +268,9 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
       }),
     };
 
+    // One small JSON write — Blob URLs are inside meta
     await redisSet(`quiz:${quiz.id}`, JSON.stringify(meta), QUIZ_TTL);
 
-    // Only legacy/local data-URLs need chunked image keys
     for (const q of quiz.questions) {
       if (q.imageDataUrl.startsWith("https://")) continue;
       await setLargeString(
@@ -271,7 +290,7 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
 export async function getQuiz(id: string): Promise<Quiz | null> {
   requireStore();
   if (hasRedis()) {
-    const raw = await redis().get(`quiz:${id}`);
+    const raw = await redisGet(`quiz:${id}`);
     const meta = parseMaybeJson<QuizMeta>(raw);
     if (!meta) return null;
     const questions: Question[] = [];
@@ -310,7 +329,7 @@ export async function getQuizQuestion(
 ): Promise<Question | null> {
   requireStore();
   if (hasRedis()) {
-    const raw = await redis().get(`quiz:${quizId}`);
+    const raw = await redisGet(`quiz:${quizId}`);
     const meta = parseMaybeJson<QuizMeta>(raw);
     if (!meta) return null;
     const q = meta.questions[index];
@@ -347,7 +366,7 @@ export async function getRoom(code: string): Promise<Room | null> {
   requireStore();
   const key = code.toUpperCase();
   if (hasRedis()) {
-    const raw = await redis().get(`room:${key}`);
+    const raw = await redisGet(`room:${key}`);
     return parseMaybeJson<Room>(raw);
   }
   if (memory().rooms[key]) return memory().rooms[key];
@@ -368,33 +387,26 @@ export async function mutateRoom(
 
   for (let attempt = 0; attempt < 12; attempt++) {
     if (hasRedis()) {
-      const r = redis();
       const redisKey = `room:${key}`;
-      let raw: unknown;
-      try {
-        raw = await r.get(redisKey);
-      } catch (e) {
-        wrapRedisError(e);
-      }
+      const raw = await redisGet(redisKey);
       if (raw == null) return null;
 
-      const prevStr = typeof raw === "string" ? raw : JSON.stringify(raw);
       const room = parseMaybeJson<Room>(raw);
       if (!room) return null;
+      const version = (room as Room & { _v?: number })._v ?? 0;
 
       mutator(room);
-      const nextStr = JSON.stringify(room);
-      try {
-        const ok = await r.eval(
-          CAS_LUA,
-          [redisKey],
-          [prevStr, nextStr, String(ROOM_TTL)],
-        );
-        if (ok === 1) return room;
-      } catch (e) {
-        wrapRedisError(e);
-      }
-      continue;
+      (room as Room & { _v?: number })._v = version + 1;
+
+      // Optimistic lock via version field
+      const current = parseMaybeJson<Room & { _v?: number }>(
+        await redisGet(redisKey),
+      );
+      if (!current) return null;
+      if ((current._v ?? 0) !== version) continue;
+
+      await redisSet(redisKey, JSON.stringify(room), ROOM_TTL);
+      return room;
     }
 
     let room = memory().rooms[key];
