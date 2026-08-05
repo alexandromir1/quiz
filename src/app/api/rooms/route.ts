@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { generateRoomCode } from "@/lib/scoring";
-import { getQuiz, getRoom, saveRoom } from "@/lib/store";
+import {
+  getQuiz,
+  getRoom,
+  saveRoom,
+  StorageNotConfiguredError,
+} from "@/lib/store";
 import type { Room } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -50,7 +55,10 @@ export async function POST(request: Request) {
     await saveRoom(room);
 
     return NextResponse.json({ code: room.code, hostSecret: room.hostSecret });
-  } catch {
+  } catch (e) {
+    if (e instanceof StorageNotConfiguredError) {
+      return NextResponse.json({ error: e.message }, { status: 503 });
+    }
     return NextResponse.json(
       { error: "Не удалось создать комнату" },
       { status: 500 },
