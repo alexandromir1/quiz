@@ -5,6 +5,7 @@ import {
   getRoom,
   saveRoom,
   StorageNotConfiguredError,
+  StorageTooLargeError,
 } from "@/lib/store";
 import type { Room } from "@/lib/types";
 
@@ -48,7 +49,7 @@ export async function POST(request: Request) {
       questionStartedAt: null,
       timeLimitMs: timeLimitSec * 1000,
       players: [],
-      questions: quiz.questions,
+      questionCount: quiz.questions.length,
       createdAt: Date.now(),
     };
 
@@ -58,6 +59,9 @@ export async function POST(request: Request) {
   } catch (e) {
     if (e instanceof StorageNotConfiguredError) {
       return NextResponse.json({ error: e.message }, { status: 503 });
+    }
+    if (e instanceof StorageTooLargeError) {
+      return NextResponse.json({ error: e.message }, { status: 413 });
     }
     return NextResponse.json(
       { error: "Не удалось создать комнату" },

@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { nanoid } from "nanoid";
-import { saveQuiz, StorageNotConfiguredError } from "@/lib/store";
+import {
+  saveQuiz,
+  StorageNotConfiguredError,
+  StorageTooLargeError,
+} from "@/lib/store";
 import type { Question, Quiz } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -45,9 +49,13 @@ export async function POST(request: Request) {
           { status: 400 },
         );
       }
-      if (q.imageDataUrl.length > 1_400_000) {
+      // ~150KB binary ≈ ~200k chars in base64 data-url
+      if (q.imageDataUrl.length > 220_000) {
         return NextResponse.json(
-          { error: "Изображение слишком большое" },
+          {
+            error:
+              "Изображение слишком большое. Выбери другое фото — оно сожмётся автоматически.",
+          },
           { status: 400 },
         );
       }
@@ -95,6 +103,9 @@ export async function POST(request: Request) {
   } catch (e) {
     if (e instanceof StorageNotConfiguredError) {
       return NextResponse.json({ error: e.message }, { status: 503 });
+    }
+    if (e instanceof StorageTooLargeError) {
+      return NextResponse.json({ error: e.message }, { status: 413 });
     }
     const message = e instanceof Error ? e.message : "Не удалось сохранить";
     return NextResponse.json({ error: message }, { status: 500 });

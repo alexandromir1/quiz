@@ -5,6 +5,9 @@ export type Question = {
   correctIndex: 0 | 1 | 2 | 3;
 };
 
+/** Quiz question without image payload (Redis-friendly). */
+export type QuestionMeta = Omit<Question, "imageDataUrl">;
+
 export type Quiz = {
   id: string;
   title: string;
@@ -29,6 +32,7 @@ export type Player = {
 
 export type GamePhase = "lobby" | "question" | "reveal" | "leaderboard" | "finished";
 
+/** Live room state — images live under the quiz keys, not in the room doc. */
 export type Room = {
   code: string;
   quizId: string;
@@ -39,7 +43,7 @@ export type Room = {
   questionStartedAt: number | null;
   timeLimitMs: number;
   players: Player[];
-  questions: Question[];
+  questionCount: number;
   createdAt: number;
 };
 

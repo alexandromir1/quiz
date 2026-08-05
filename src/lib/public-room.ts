@@ -1,22 +1,9 @@
-import type { PublicRoom, Room } from "./types";
+import type { PublicQuestion, PublicRoom, Room } from "./types";
 
-export function toPublicRoom(room: Room): PublicRoom {
-  const reveal =
-    room.phase === "reveal" ||
-    room.phase === "leaderboard" ||
-    room.phase === "finished";
-
-  const q = room.questions[room.questionIndex] ?? null;
-  const currentQuestion =
-    q && (room.phase === "question" || reveal)
-      ? {
-          id: q.id,
-          imageDataUrl: q.imageDataUrl,
-          answers: q.answers,
-          ...(reveal ? { correctIndex: q.correctIndex } : {}),
-        }
-      : null;
-
+export function toPublicRoom(
+  room: Room,
+  question: PublicQuestion | null,
+): PublicRoom {
   return {
     code: room.code,
     quizTitle: room.quizTitle,
@@ -29,7 +16,33 @@ export function toPublicRoom(room: Room): PublicRoom {
       name: p.name,
       score: p.score,
     })),
-    questionCount: room.questions.length,
-    currentQuestion,
+    questionCount: room.questionCount,
+    currentQuestion: question,
+  };
+}
+
+export function shouldExposeQuestion(phase: Room["phase"]): boolean {
+  return (
+    phase === "question" ||
+    phase === "reveal" ||
+    phase === "leaderboard" ||
+    phase === "finished"
+  );
+}
+
+export function toPublicQuestion(
+  question: {
+    id: string;
+    imageDataUrl: string;
+    answers: [string, string, string, string];
+    correctIndex: 0 | 1 | 2 | 3;
+  },
+  reveal: boolean,
+): PublicQuestion {
+  return {
+    id: question.id,
+    imageDataUrl: question.imageDataUrl,
+    answers: question.answers,
+    ...(reveal ? { correctIndex: question.correctIndex } : {}),
   };
 }
