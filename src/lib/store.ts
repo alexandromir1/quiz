@@ -83,7 +83,9 @@ async function writeFileStore<T>(file: string, data: Record<string, T>) {
   await fs.writeFile(file, JSON.stringify(data), "utf8");
 }
 
-async function streamToText(stream: ReadableStream<Uint8Array>): Promise<string> {
+async function streamToText(
+  stream: ReadableStream<Uint8Array>,
+): Promise<string> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   for (;;) {
@@ -100,9 +102,14 @@ async function streamToText(stream: ReadableStream<Uint8Array>): Promise<string>
   return new TextDecoder().decode(merged);
 }
 
+/**
+ * Quiz/room JSON is PRIVATE so reads go through the Blob API token
+ * (public CDN fetch returned 403 from Vercel serverless).
+ * Images stay public via /api/upload for <img src>.
+ */
 async function blobPutJson(pathname: string, data: unknown): Promise<string> {
   const result = await put(pathname, JSON.stringify(data), {
-    access: "public",
+    access: "private",
     addRandomSuffix: false,
     allowOverwrite: true,
     contentType: "application/json",
@@ -111,18 +118,24 @@ async function blobPutJson(pathname: string, data: unknown): Promise<string> {
 }
 
 async function blobGetJson<T>(pathname: string): Promise<T | null> {
-  // Official SDK read — avoids public CDN 403 from serverless fetches
   for (let attempt = 0; attempt < 6; attempt++) {
-    const result = await get(pathname, {
-      access: "public",
-      useCache: false,
-    });
-    if (!result || result.statusCode !== 200 || !result.stream) {
+    try {
+      const result = await get(pathname, {
+        access: "private",
+        useCache: false,
+      });
+      if (!result || result.statusCode !== 200 || !result.stream) {
+        await sleep(120 * (attempt + 1));
+        continue;
+      }
+      const text = await streamToText(result.stream);
+      return JSON.parse(text) as T;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // Not found vs transient errors
+      if (/not found|404/i.test(msg) && attempt === 5) return null;
       await sleep(150 * (attempt + 1));
-      continue;
     }
-    const text = await streamToText(result.stream);
-    return JSON.parse(text) as T;
   }
   return null;
 }
@@ -142,14 +155,14 @@ export async function pingRedis(): Promise<{
       return {
         ok: got?.ok === true,
         latencyMs: Date.now() - started,
-        storage: "blob",
+        storage: "blob-private",
       };
     } catch (e) {
       return {
         ok: false,
         error: e instanceof Error ? e.message : String(e),
         latencyMs: Date.now() - started,
-        storage: "blob",
+        storage: "blob-private",
       };
     }
   }
@@ -160,13 +173,14 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
   requireStore();
   if (hasBlob()) {
     await blobPutJson(`quizzes/${quiz.id}.json`, quiz);
-    // Verify readable before returning to client
     for (let i = 0; i < 8; i++) {
       const got = await blobGetJson<Quiz>(`quizzes/${quiz.id}.json`);
       if (got?.id === quiz.id) return;
       await sleep(100 * (i + 1));
     }
-    throw new Error("Викторина сохранена, но пока не читается. Попробуй ещё раз.");
+    throw new Error(
+      "Викторина сохранена, но пока не читается. Попробуй ещё раз.",
+    );
   }
   memory().quizzes[quiz.id] = quiz;
   const all = await readFileStore<Quiz>(QUIZZES_FILE);
@@ -254,7 +268,6 @@ export async function mutateRoom(
           await sleep(80 * (i + 1));
           continue;
         }
-        // Our write landed (or a newer one that already includes further progress)
         if ((verify._v ?? 0) >= (room._v ?? 0)) return verify;
         await sleep(80 * (i + 1));
       }
