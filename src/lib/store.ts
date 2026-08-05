@@ -7,6 +7,15 @@ const DATA_DIR = path.join(process.cwd(), ".data");
 const QUIZZES_FILE = path.join(DATA_DIR, "quizzes.json");
 const ROOMS_FILE = path.join(DATA_DIR, "rooms.json");
 
+export class StorageNotConfiguredError extends Error {
+  constructor() {
+    super(
+      "На Vercel нужно подключить Redis: в проекте открой Storage → Create → Upstash Redis (или KV). Переменные подставятся сами, затем сделай Redeploy.",
+    );
+    this.name = "StorageNotConfiguredError";
+  }
+}
+
 type StoreShape = {
   quizzes: Record<string, Quiz>;
   rooms: Record<string, Room>;
@@ -23,14 +32,34 @@ function memory(): StoreShape {
   return globalStore.__quizMemory;
 }
 
-function hasRedis() {
+function isVercel() {
+  return Boolean(process.env.VERCEL);
+}
+
+/** Upstash Redis or Vercel KV (same protocol). */
+export function hasRedis() {
   return Boolean(
-    process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN,
+    (process.env.UPSTASH_REDIS_REST_URL &&
+      process.env.UPSTASH_REDIS_REST_TOKEN) ||
+      (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) ||
+      (process.env.KV_REST_API_URL && process.env.REDIS_URL),
   );
 }
 
 function redis() {
-  return Redis.fromEnv();
+  const url =
+    process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token =
+    process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  if (!url || !token) {
+    throw new StorageNotConfiguredError();
+  }
+  return new Redis({ url, token });
+}
+
+function requireStore() {
+  if (hasRedis()) return;
+  if (isVercel()) throw new StorageNotConfiguredError();
 }
 
 async function ensureDataDir() {
@@ -73,6 +102,7 @@ function parseMaybeJson<T>(value: unknown): T | null {
 }
 
 export async function saveQuiz(quiz: Quiz): Promise<void> {
+  requireStore();
   if (hasRedis()) {
     await redis().set(`quiz:${quiz.id}`, JSON.stringify(quiz));
     return;
@@ -84,6 +114,7 @@ export async function saveQuiz(quiz: Quiz): Promise<void> {
 }
 
 export async function getQuiz(id: string): Promise<Quiz | null> {
+  requireStore();
   if (hasRedis()) {
     const raw = await redis().get(`quiz:${id}`);
     return parseMaybeJson<Quiz>(raw);
@@ -98,6 +129,7 @@ export async function getQuiz(id: string): Promise<Quiz | null> {
 }
 
 export async function saveRoom(room: Room): Promise<void> {
+  requireStore();
   if (hasRedis()) {
     await redis().set(`room:${room.code}`, JSON.stringify(room), {
       ex: 60 * 60 * 24,
@@ -111,6 +143,7 @@ export async function saveRoom(room: Room): Promise<void> {
 }
 
 export async function getRoom(code: string): Promise<Room | null> {
+  requireStore();
   const key = code.toUpperCase();
   if (hasRedis()) {
     const raw = await redis().get(`room:${key}`);
@@ -130,6 +163,7 @@ export async function mutateRoom(
   code: string,
   mutator: (room: Room) => void,
 ): Promise<Room | null> {
+  requireStore();
   const key = code.toUpperCase();
 
   for (let attempt = 0; attempt < 12; attempt++) {

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { nanoid } from "nanoid";
-import { saveQuiz } from "@/lib/store";
+import { saveQuiz, StorageNotConfiguredError } from "@/lib/store";
 import type { Question, Quiz } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -92,7 +92,11 @@ export async function POST(request: Request) {
       title: quiz.title,
       questionCount: quiz.questions.length,
     });
-  } catch {
-    return NextResponse.json({ error: "Не удалось сохранить" }, { status: 500 });
+  } catch (e) {
+    if (e instanceof StorageNotConfiguredError) {
+      return NextResponse.json({ error: e.message }, { status: 503 });
+    }
+    const message = e instanceof Error ? e.message : "Не удалось сохранить";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
