@@ -42,21 +42,26 @@ export async function POST(request: Request) {
     }
 
     const questions: Question[] = [];
+    const blobRequired = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
+
     for (const q of body.questions) {
-      if (
-        !q.imageDataUrl?.startsWith("data:image/") &&
-        !q.imageDataUrl?.startsWith("https://")
-      ) {
+      const src = q.imageDataUrl ?? "";
+      if (blobRequired && !src.startsWith("https://")) {
+        return NextResponse.json(
+          {
+            error:
+              "Нужна загрузка фото в Blob. Обнови страницу и заново выбери изображения.",
+          },
+          { status: 400 },
+        );
+      }
+      if (!src.startsWith("data:image/") && !src.startsWith("https://")) {
         return NextResponse.json(
           { error: "Каждый вопрос должен содержать изображение" },
           { status: 400 },
         );
       }
-      // data URLs must stay small; https Blob URLs are short
-      if (
-        q.imageDataUrl.startsWith("data:image/") &&
-        q.imageDataUrl.length > 220_000
-      ) {
+      if (src.startsWith("data:image/") && src.length > 220_000) {
         return NextResponse.json(
           {
             error:
@@ -84,7 +89,7 @@ export async function POST(request: Request) {
       }
       questions.push({
         id: nanoid(10),
-        imageDataUrl: q.imageDataUrl,
+        imageDataUrl: src,
         answers: answers as [string, string, string, string],
         correctIndex: q.correctIndex as 0 | 1 | 2 | 3,
       });

@@ -2,11 +2,11 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ANSWER_STYLES } from "@/components/answer-grid";
 import {
   fileToCompressedDataUrl,
-  fileToCompressedJpegFile,
+  fileToCompressedJpegBlob,
 } from "@/lib/image";
 
 type DraftQuestion = {
@@ -25,20 +25,41 @@ function emptyQuestion(): DraftQuestion {
   };
 }
 
-async function prepareImage(file: File): Promise<string> {
-  // Prefer Vercel Blob URL (tiny Redis value). Fall back to compressed data URL.
+async function blobEnabled(): Promise<boolean> {
   try {
-    const jpeg = await fileToCompressedJpegFile(file);
-    const form = new FormData();
-    form.append("file", jpeg);
-    const res = await fetch("/api/upload", { method: "POST", body: form });
-    if (res.ok) {
-      const data = (await res.json()) as { url?: string };
-      if (data.url) return data.url;
-    }
+    const res = await fetch("/api/upload", { cache: "no-store" });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { blob?: boolean };
+    return Boolean(data.blob);
   } catch {
-    // continue to data-URL fallback
+    return false;
   }
+}
+
+async function prepareImage(file: File, requireBlob: boolean): Promise<string> {
+  const jpegBlob = await fileToCompressedJpegBlob(file);
+  const jpegFile = new File([jpegBlob], "question.jpg", { type: "image/jpeg" });
+
+  const form = new FormData();
+  form.append("file", jpegFile);
+  const res = await fetch("/api/upload", { method: "POST", body: form });
+  const data = (await res.json().catch(() => null)) as {
+    url?: string;
+    error?: string;
+  } | null;
+
+  if (res.ok && data?.url?.startsWith("https://")) {
+    return data.url;
+  }
+
+  if (requireBlob) {
+    throw new Error(
+      data?.error
+        ? `Не удалось загрузить фото в Blob: ${data.error}`
+        : "Не удалось загрузить фото в Blob. Обнови страницу и попробуй снова.",
+    );
+  }
+
   return fileToCompressedDataUrl(file);
 }
 
@@ -49,18 +70,25 @@ export default function CreatePage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadingIndex, setUploadingIndex] = useState<number | null>(null);
+  const [useBlob, setUseBlob] = useState(false);
+
+  useEffect(() => {
+    void blobEnabled().then(setUseBlob);
+  }, []);
 
   async function onImageChange(index: number, file: File | null) {
     if (!file) return;
     setError(null);
     setUploadingIndex(index);
     try {
-      const imageDataUrl = await prepareImage(file);
+      const requireBlob = useBlob || (await blobEnabled());
+      if (requireBlob) setUseBlob(true);
+      const imageDataUrl = await prepareImage(file, requireBlob);
       setQuestions((prev) =>
         prev.map((q, i) => (i === index ? { ...q, imageDataUrl } : q)),
       );
-    } catch {
-      setError("Не удалось обработать изображение");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Не удалось обработать изображение");
     } finally {
       setUploadingIndex(null);
     }
@@ -70,6 +98,15 @@ export default function CreatePage() {
     setError(null);
     setSaving(true);
     try {
+      if (useBlob) {
+        const bad = questions.find((q) => !q.imageDataUrl.startsWith("https://"));
+        if (bad) {
+          throw new Error(
+            "Фото ещё в старом формате. Заново выбери изображение для каждого вопроса (после подключения Blob).",
+          );
+        }
+      }
+
       const res = await fetch("/api/quizzes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -116,6 +153,12 @@ export default function CreatePage() {
       <p className="mt-3 text-[var(--muted)]">
         Картинка + четыре варианта. Отметь правильный ответ.
       </p>
+      {useBlob && (
+        <p className="mt-3 rounded-xl bg-[var(--accent)]/10 px-4 py-3 text-sm text-[var(--accent)]">
+          Blob подключён. После обновления страницы заново выбери каждое фото —
+          они загрузятся как ссылки, а не в Redis.
+        </p>
+      )}
 
       <label className="mt-8 block">
         <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">
