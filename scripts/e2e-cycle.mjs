@@ -127,6 +127,8 @@ async function main() {
   );
   ok("start question");
 
+  await new Promise((r) => setTimeout(r, 300));
+
   const a1 = await req(`/api/rooms/${code}/answer`, {
     method: "POST",
     body: JSON.stringify({ playerId: p1.json.playerId, answerIndex: 0 }),
@@ -141,7 +143,16 @@ async function main() {
     method: "POST",
     body: JSON.stringify({ playerId: p2.json.playerId, answerIndex: 1 }),
   });
-  assert(a2.status === 200 && a2.json.correct === false && a2.json.points === 0, `answer2: ${a2.text}`);
+  // Retry once if storage lag
+  let a2final = a2;
+  if (a2.status !== 200) {
+    await new Promise((r) => setTimeout(r, 400));
+    a2final = await req(`/api/rooms/${code}/answer`, {
+      method: "POST",
+      body: JSON.stringify({ playerId: p2.json.playerId, answerIndex: 1 }),
+    });
+  }
+  assert(a2final.status === 200 && a2final.json.correct === false && a2final.json.points === 0, `answer2: ${a2final.text}`);
   ok("player2 wrong = 0");
 
   const reveal = await req(`/api/rooms/${code}/action`, {

@@ -252,7 +252,15 @@ export async function mutateRoom(
       if ((latest._v ?? 0) !== version) continue;
 
       await blobPutJson(`rooms/${key}.json`, room);
-      return room;
+      // Ensure the write is visible before callers continue the game loop
+      for (let i = 0; i < 8; i++) {
+        const verify = await blobGetJson<Room & { _v?: number }>(
+          `rooms/${key}.json`,
+        );
+        if (verify && (verify._v ?? 0) === room._v) return room;
+        await sleep(80 * (i + 1));
+      }
+      continue;
     }
 
     let room = memory().rooms[key];
