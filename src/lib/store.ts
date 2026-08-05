@@ -451,6 +451,58 @@ export async function getRoom(code: string): Promise<Room | null> {
   return null;
 }
 
+function roomVersion(room: Room): number {
+  return (room as Room & { _v?: number })._v ?? 0;
+}
+
+/** Merge concurrent room writes so answer/reveal don't wipe each other. */
+function mergeRooms(
+  base: Room & { _v?: number },
+  incoming: Room & { _v?: number },
+): Room & { _v?: number } {
+  const phaseRank: Record<Room["phase"], number> = {
+    lobby: 0,
+    question: 1,
+    reveal: 2,
+    leaderboard: 3,
+    finished: 4,
+  };
+
+  const out = structuredClone(base) as Room & { _v?: number };
+
+  // Prefer further-along phase; keep matching question index from the further phase
+  if (phaseRank[incoming.phase] > phaseRank[out.phase]) {
+    out.phase = incoming.phase;
+    out.questionIndex = incoming.questionIndex;
+    out.questionStartedAt = incoming.questionStartedAt;
+  } else if (
+    phaseRank[incoming.phase] === phaseRank[out.phase] &&
+    incoming.questionIndex > out.questionIndex
+  ) {
+    out.questionIndex = incoming.questionIndex;
+    out.questionStartedAt = incoming.questionStartedAt;
+    out.phase = incoming.phase;
+  }
+
+  const byId = new Map(out.players.map((p) => [p.id, p]));
+  for (const p of incoming.players) {
+    const existing = byId.get(p.id);
+    if (!existing) {
+      byId.set(p.id, structuredClone(p));
+      continue;
+    }
+    existing.name = p.name || existing.name;
+    existing.answers = { ...existing.answers, ...p.answers };
+    existing.score = Object.values(existing.answers).reduce(
+      (sum, a) => sum + a.points,
+      0,
+    );
+  }
+  out.players = [...byId.values()];
+  out._v = Math.max(roomVersion(base), roomVersion(incoming)) + 1;
+  return out;
+}
+
 export async function mutateRoom(
   code: string,
   mutator: (room: Room) => void,
@@ -458,32 +510,56 @@ export async function mutateRoom(
   requireStore();
   const key = code.toUpperCase();
 
-  for (let attempt = 0; attempt < 10; attempt++) {
+  for (let attempt = 0; attempt < 12; attempt++) {
     const room = await getRoom(key);
     if (!room) return null;
 
-    const version = (room as Room & { _v?: number })._v ?? 0;
+    const version = roomVersion(room);
     const clone = structuredClone(room) as Room & { _v?: number };
     mutator(clone);
     clone._v = version + 1;
     clone.code = key;
 
-    const redisOk = await redisSet(roomKey(key), clone, ROOM_TTL_SEC);
-    if (hasBlob()) {
-      await blobPutJson(`rooms/${key}`, clone);
-    }
+    try {
+      const redisOk = await redisSet(roomKey(key), clone, ROOM_TTL_SEC);
+      if (hasBlob()) {
+        await blobPutJson(`rooms/${key}`, clone);
+      }
 
-    if (redisOk || hasBlob()) {
-      memory().rooms[key] = clone;
-      return clone;
-    }
+      if (redisOk || hasBlob()) {
+        memory().rooms[key] = clone;
 
-    if (!isVercel()) {
-      memory().rooms[key] = clone;
-      const all = await readFileStore<Room>(ROOMS_FILE);
-      all[key] = clone;
-      await writeFileStore(ROOMS_FILE, all);
-      return clone;
+        // Detect lost race: a newer blob may have overwritten without our changes
+        await sleep(40);
+        blobDataCache().delete(`rooms/${key}`);
+        const latest = await getRoom(key);
+        if (!latest) return clone;
+
+        if (roomVersion(latest) <= roomVersion(clone)) {
+          return latest;
+        }
+
+        // Newer version won the race — merge both and write once more
+        const merged = mergeRooms(
+          latest as Room & { _v?: number },
+          clone,
+        );
+        memory().rooms[key] = merged;
+        await redisSet(roomKey(key), merged, ROOM_TTL_SEC);
+        if (hasBlob()) await blobPutJson(`rooms/${key}`, merged);
+        return merged;
+      }
+
+      if (!isVercel()) {
+        memory().rooms[key] = clone;
+        const all = await readFileStore<Room>(ROOMS_FILE);
+        all[key] = clone;
+        await writeFileStore(ROOMS_FILE, all);
+        return clone;
+      }
+    } catch {
+      await sleep(100 * (attempt + 1));
+      continue;
     }
 
     await sleep(80 * (attempt + 1));

@@ -13,6 +13,7 @@ import {
 } from "@/lib/public-room";
 
 export const runtime = "nodejs";
+export const maxDuration = 30;
 
 type Body = {
   playerId?: string;
@@ -25,7 +26,12 @@ export async function POST(
 ) {
   try {
     const { code } = await context.params;
-    const body = (await request.json()) as Body;
+    let body: Body;
+    try {
+      body = (await request.json()) as Body;
+    } catch {
+      return NextResponse.json({ error: "Некорректный запрос" }, { status: 400 });
+    }
 
     if (
       typeof body.answerIndex !== "number" ||
@@ -39,19 +45,25 @@ export async function POST(
     }
 
     let existing = await getRoom(code);
-    for (let i = 0; i < 6 && existing && existing.phase !== "question"; i++) {
-      await new Promise((r) => setTimeout(r, 120 * (i + 1)));
+    for (let i = 0; i < 8 && existing && existing.phase === "lobby"; i++) {
+      await new Promise((r) => setTimeout(r, 150 * (i + 1)));
       existing = await getRoom(code);
     }
     if (!existing) {
       return NextResponse.json({ error: "Комната не найдена" }, { status: 404 });
     }
-    if (existing.phase !== "question" || existing.questionStartedAt == null) {
+
+    // Allow a short grace if host just flipped to reveal
+    if (
+      existing.phase !== "question" &&
+      existing.phase !== "reveal"
+    ) {
       return NextResponse.json(
         { error: "Сейчас нельзя отвечать" },
         { status: 400 },
       );
     }
+
     const question = await getQuizQuestion(
       existing.quizId,
       existing.questionIndex,
@@ -71,7 +83,8 @@ export async function POST(
     };
 
     const room = await mutateRoom(code, (room) => {
-      if (room.phase !== "question" || room.questionStartedAt == null) {
+      // Accept during question, or during reveal if answer not stored yet (race with host timer)
+      if (room.phase !== "question" && room.phase !== "reveal") {
         state.error = "Сейчас нельзя отвечать";
         return;
       }
@@ -93,15 +106,19 @@ export async function POST(
         return;
       }
 
-      const elapsed = Date.now() - room.questionStartedAt;
-      if (elapsed > room.timeLimitMs + 1500) {
+      const startedAt = room.questionStartedAt ?? Date.now();
+      const elapsed = Date.now() - startedAt;
+      if (room.phase === "question" && elapsed > room.timeLimitMs + 2000) {
         state.error = "Время вышло";
         return;
       }
 
-      const timeMs = Math.min(elapsed, room.timeLimitMs);
+      const timeMs = Math.min(Math.max(elapsed, 0), room.timeLimitMs);
       const correct = body.answerIndex === question.correctIndex;
-      const points = scoreAnswer(correct, timeMs, room.timeLimitMs);
+      const points =
+        room.phase === "question"
+          ? scoreAnswer(correct, timeMs, room.timeLimitMs)
+          : scoreAnswer(correct, room.timeLimitMs, room.timeLimitMs); // min points if raced into reveal
 
       player.answers[question.id] = {
         answerIndex: body.answerIndex!,

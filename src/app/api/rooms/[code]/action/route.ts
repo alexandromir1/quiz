@@ -11,6 +11,7 @@ import {
 } from "@/lib/public-room";
 
 export const runtime = "nodejs";
+export const maxDuration = 30;
 
 type Body = {
   hostSecret?: string;
@@ -23,9 +24,17 @@ export async function POST(
 ) {
   try {
     const { code } = await context.params;
-    const body = (await request.json()) as Body;
+    let body: Body;
+    try {
+      body = (await request.json()) as Body;
+    } catch {
+      return NextResponse.json({ error: "Некорректный запрос" }, { status: 400 });
+    }
     if (!body.hostSecret) {
       return NextResponse.json({ error: "Нет доступа" }, { status: 403 });
+    }
+    if (!body.action) {
+      return NextResponse.json({ error: "Неизвестное действие" }, { status: 400 });
     }
 
     const state = { error: null as string | null, status: 400 };
@@ -39,6 +48,10 @@ export async function POST(
 
       switch (body.action) {
         case "start": {
+          if (room.phase === "question" && room.questionIndex === 0) {
+            // Idempotent: already started
+            return;
+          }
           if (room.phase !== "lobby") {
             state.error = "Игра уже идёт";
             return;
@@ -53,6 +66,14 @@ export async function POST(
           break;
         }
         case "reveal": {
+          // Idempotent — host timer may fire more than once
+          if (
+            room.phase === "reveal" ||
+            room.phase === "leaderboard" ||
+            room.phase === "finished"
+          ) {
+            return;
+          }
           if (room.phase !== "question") {
             state.error = "Сейчас нет вопроса";
             return;
@@ -61,6 +82,9 @@ export async function POST(
           break;
         }
         case "leaderboard": {
+          if (room.phase === "leaderboard" || room.phase === "finished") {
+            return;
+          }
           if (room.phase !== "reveal") {
             state.error = "Сначала покажите ответ";
             return;
@@ -69,6 +93,13 @@ export async function POST(
           break;
         }
         case "next": {
+          if (room.phase === "finished") {
+            return;
+          }
+          if (room.phase === "question") {
+            // Already advanced (duplicate click / race)
+            return;
+          }
           if (room.phase !== "leaderboard" && room.phase !== "reveal") {
             state.error = "Нельзя перейти дальше";
             return;
@@ -115,6 +146,7 @@ export async function POST(
     if (e instanceof StorageNotConfiguredError) {
       return NextResponse.json({ error: e.message }, { status: 503 });
     }
-    return NextResponse.json({ error: "Ошибка сервера" }, { status: 500 });
+    const message = e instanceof Error ? e.message : "Ошибка сервера";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

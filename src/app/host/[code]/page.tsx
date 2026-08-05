@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnswerGrid } from "@/components/answer-grid";
 import { CountdownBar } from "@/components/countdown-bar";
 import { Leaderboard } from "@/components/leaderboard";
@@ -27,11 +27,13 @@ export default function HostPage() {
     [origin],
   );
 
+  const revealQueuedFor = useRef<number | null>(null);
+
   const runAction = useCallback(
     async (action: "start" | "reveal" | "leaderboard" | "next" | "finish") => {
       if (!hostSecret) return;
       setBusy(true);
-      setActionError(null);
+      if (action !== "reveal") setActionError(null);
       try {
         const res = await fetch(`/api/rooms/${code}/action`, {
           method: "POST",
@@ -39,7 +41,16 @@ export default function HostPage() {
           body: JSON.stringify({ hostSecret, action }),
         });
         const data = (await res.json()) as { error?: string };
-        if (!res.ok) throw new Error(data.error ?? "Ошибка");
+        if (!res.ok) {
+          // Benign races with auto-reveal / double-click
+          if (
+            action === "reveal" &&
+            (res.status === 400 || res.status === 409)
+          ) {
+            return;
+          }
+          throw new Error(data.error ?? "Ошибка");
+        }
       } catch (e) {
         setActionError(e instanceof Error ? e.message : "Ошибка");
       } finally {
@@ -51,15 +62,31 @@ export default function HostPage() {
 
   useEffect(() => {
     if (!room || room.phase !== "question" || !room.questionStartedAt) return;
+    if (revealQueuedFor.current === room.questionIndex) return;
+
     const remaining =
       room.timeLimitMs - (Date.now() - room.questionStartedAt) + 400;
-    if (remaining <= 0) {
+
+    const fireReveal = () => {
+      if (revealQueuedFor.current === room.questionIndex) return;
+      revealQueuedFor.current = room.questionIndex;
       void runAction("reveal");
+    };
+
+    if (remaining <= 0) {
+      fireReveal();
       return;
     }
-    const id = window.setTimeout(() => void runAction("reveal"), remaining);
+    const id = window.setTimeout(fireReveal, remaining);
     return () => window.clearTimeout(id);
-  }, [room, runAction]);
+  }, [
+    room?.phase,
+    room?.questionIndex,
+    room?.questionStartedAt,
+    room?.timeLimitMs,
+    runAction,
+    room,
+  ]);
 
   if (loading) {
     return (
